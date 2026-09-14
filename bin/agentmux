@@ -1,0 +1,343 @@
+#!/bin/sh
+# agentmux CLI.
+#
+#   agentmux install-hooks [--purge-legacy] [--hook-path PATH]   register the hook with Claude Code + Codex
+#   agentmux uninstall-hooks [--purge-legacy]                     remove every agentmux hook entry
+#   agentmux status [--gc]                                        show hook/tmux/scratch state
+#   agentmux toggle <client>                                      open/close the sidebar (bound to prefix+a)
+#   agentmux ensure                                               create the sidebar if on and missing
+#   agentmux title-changed <pane>                                 decode an ssh pane's AGX1 title
+#   agentmux notify <title> <body>                                desktop notification, no sound
+#
+# Config files: ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json, ${CODEX_HOME:-~/.codex}/hooks.json
+# and config.toml. Files are rewritten in place (`cat tmp > file`) so symlinks survive.
+set -u
+BIN_DIR=$(cd "$(dirname "$0")" && pwd)
+PLUGIN_DIR=$(cd "$BIN_DIR/.." && pwd)
+# shellcheck source=lib/constants.sh
+. "$PLUGIN_DIR/lib/constants.sh"
+O=$AGENTMUX_OPT
+
+CLAUDE_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+CODEX_DIR=${CODEX_HOME:-$HOME/.codex}
+CLAUDE_SETTINGS=$CLAUDE_DIR/settings.json
+CODEX_HOOKS=$CODEX_DIR/hooks.json
+CODEX_CONFIG=$CODEX_DIR/config.toml
+
+die() { printf 'agentmux: %s\n' "$*" >&2; exit 1; }
+log() { printf 'agentmux: %s\n' "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+find_tmux() {
+  if have tmux; then command -v tmux; return; fi
+  for c in /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux; do
+    [ -x "$c" ] && { printf '%s' "$c"; return; }
+  done
+  return 1
+}
+
+# ------------------------------------------------------------------- hook install ----
+
+# The path written into settings files. Prefer the TPM location (portable across machines
+# that install the plugin the same way) spelled with ~, else this checkout's absolute path.
+default_hook_path() {
+  tpm=${TMUX_PLUGIN_MANAGER_PATH:-$HOME/.tmux/plugins}
+  tpm=${tpm%/}
+  cand="$tpm/$AGENTMUX_PLUGIN/hooks/agentmux-hook"
+  if [ -x "$cand" ]; then
+    case $cand in "$HOME"/*) printf '~%s' "${cand#"$HOME"}" ;; *) printf '%s' "$cand" ;; esac
+  else
+    printf '%s' "$PLUGIN_DIR/hooks/agentmux-hook"
+  fi
+}
+
+json_valid() {
+  if have jq; then jq -e . "$1" >/dev/null 2>&1
+  else python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$1" >/dev/null 2>&1
+  fi
+}
+
+# merge_file FILE TEMPLATE MODE LEGACY(0|1) HOOKPATH
+merge_file() {
+  file=$1 tpl=$2 mode=$3 legacy=$4 hookpath=$5
+  dir=$(dirname "$file")
+  [ -d "$dir" ] || mkdir -p "$dir" || die "cannot create $dir"
+  if [ ! -e "$file" ]; then
+    [ "$mode" = install ] || return 0
+    printf '{}\n' >"$file" || die "cannot create $file"
+  fi
+  json_valid "$file" || die "$file is not valid JSON, refusing to touch it"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/agentmux.XXXXXX") || die mktemp
+  if have jq; then
+    jq --indent 2 --argjson tpl "$(cat "$tpl")" --arg hook "$hookpath" --arg mode "$mode" \
+      --arg legacy "$legacy" -f "$PLUGIN_DIR/lib/merge-hooks.jq" "$file" >"$tmp" || {
+      rm -f "$tmp"; die "jq merge failed for $file"
+    }
+  elif have python3; then
+    set -- --template "$tpl" --hook "$hookpath" --mode "$mode"
+    [ "$legacy" = 1 ] && set -- "$@" --legacy
+    python3 "$PLUGIN_DIR/lib/merge-hooks.py" "$@" <"$file" >"$tmp" || {
+      rm -f "$tmp"; die "python merge failed for $file"
+    }
+  else
+    rm -f "$tmp"; die "need jq or python3 to edit $file"
+  fi
+  json_valid "$tmp" || { rm -f "$tmp"; die "merge produced invalid JSON for $file (bug)"; }
+  if cmp -s "$file" "$tmp"; then
+    rm -f "$tmp"
+    log "$file unchanged"
+    return 0
+  fi
+  [ -e "$file.agentmux.bak" ] || cp "$file" "$file.agentmux.bak"
+  cat "$tmp" >"$file" || die "cannot write $file"
+  rm -f "$tmp"
+  log "$file updated ($mode)"
+}
+
+# Ensure `[features]` has `hooks = true`, touching as little as possible: flip an existing
+# `hooks = false` line, insert the key under an existing header, or append both.
+ensure_codex_feature() {
+  file=$CODEX_CONFIG
+  [ -e "$file" ] || { mkdir -p "$(dirname "$file")"; : >"$file"; }
+  if awk '
+    /^[[:space:]]*\[/ { sect = ($0 ~ /^[[:space:]]*\[features\][[:space:]]*(#.*)?$/) }
+    sect && /^[[:space:]]*hooks[[:space:]]*=[[:space:]]*true/ { found = 1 }
+    END { exit found ? 0 : 1 }' "$file"; then
+    return 0
+  fi
+  tmp=$(mktemp "${TMPDIR:-/tmp}/agentmux.XXXXXX") || die mktemp
+  awk '
+    /^[[:space:]]*\[/ {
+      if (sect && !done) { print "hooks = true"; done = 1 }
+      sect = ($0 ~ /^[[:space:]]*\[features\][[:space:]]*(#.*)?$/)
+      seen = seen || sect
+    }
+    sect && /^[[:space:]]*hooks[[:space:]]*=[[:space:]]*false/ { sub(/false/, "true"); done = 1 }
+    { print }
+    END {
+      if (!seen) { if (NR > 0) print ""; print "[features]"; print "hooks = true" }
+      else if (!done) print "hooks = true"
+    }' "$file" >"$tmp" || { rm -f "$tmp"; die "awk failed on $file"; }
+  if ! cmp -s "$file" "$tmp"; then
+    [ -e "$file.agentmux.bak" ] || cp "$file" "$file.agentmux.bak"
+    cat "$tmp" >"$file"
+    log "$file: enabled [features] hooks = true"
+  fi
+  rm -f "$tmp"
+}
+
+cmd_install_hooks() {
+  legacy=0
+  hookpath=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+    --purge-legacy) legacy=1 ;;
+    --hook-path) shift; hookpath=$1 ;;
+    *) die "install-hooks: unknown argument $1" ;;
+    esac
+    shift
+  done
+  [ -n "$hookpath" ] || hookpath=$(default_hook_path)
+  merge_file "$CLAUDE_SETTINGS" "$PLUGIN_DIR/hooks/claude.hooks.json" install "$legacy" "$hookpath"
+  merge_file "$CODEX_HOOKS" "$PLUGIN_DIR/hooks/codex.hooks.json" install "$legacy" "$hookpath"
+  ensure_codex_feature
+  log "hook command: $hookpath"
+  log "restart running agents (hooks are read at session start)."
+  log "Codex: run /hooks once in its TUI to trust the new hooks."
+}
+
+cmd_uninstall_hooks() {
+  legacy=0
+  for a in "$@"; do
+    case $a in --purge-legacy) legacy=1 ;; *) die "uninstall-hooks: unknown argument $a" ;; esac
+  done
+  merge_file "$CLAUDE_SETTINGS" "$PLUGIN_DIR/hooks/claude.hooks.json" uninstall "$legacy" x
+  merge_file "$CODEX_HOOKS" "$PLUGIN_DIR/hooks/codex.hooks.json" uninstall "$legacy" x
+}
+
+# ------------------------------------------------------------------------- status ----
+
+hook_events() { # FILE -> "event(count)" lines for our entries
+  [ -e "$1" ] || { printf '  (missing)\n'; return; }
+  if have jq; then
+    jq -r '.hooks // {} | to_entries[] | "\(.key) \([.value[]?.hooks[]? | select((.command // "") | test("agentmux-hook"))] | length)"' "$1" 2>/dev/null \
+      | awk '$2 > 0 { printf "  %-20s %s\n", $1, $2 } END { if (!NR) print "  (none)" }'
+  else
+    python3 - "$1" <<'EOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+found = False
+for ev, groups in (doc.get("hooks") or {}).items():
+    n = sum(1 for g in groups or [] for h in (g.get("hooks") or []) if "agentmux-hook" in str(h.get("command", "")))
+    if n:
+        found = True
+        print(f"  {ev:<20} {n}")
+if not found:
+    print("  (none)")
+EOF
+  fi
+}
+
+cmd_status() {
+  gc=0
+  for a in "$@"; do case $a in --gc) gc=1 ;; esac; done
+  printf 'plugin dir : %s\n' "$PLUGIN_DIR"
+  hp=$(default_hook_path)
+  hp_abs=$hp
+  case $hp in "~"/*) hp_abs="$HOME${hp#"~"}" ;; esac
+  printf 'hook       : %s (%s)\n' "$hp" "$([ -x "$hp_abs" ] && echo executable || echo NOT EXECUTABLE)"
+  for t in tmux jq python3 terminal-notifier osascript notify-send; do
+    printf '%-18s %s\n' "$t" "$(command -v "$t" 2>/dev/null || echo -)"
+  done
+  printf 'claude settings : %s\n' "$CLAUDE_SETTINGS"; hook_events "$CLAUDE_SETTINGS"
+  printf 'codex hooks     : %s\n' "$CODEX_HOOKS"; hook_events "$CODEX_HOOKS"
+  if [ -e "$CODEX_CONFIG" ]; then
+    printf 'codex features  : %s\n' "$(grep -E '^[[:space:]]*hooks[[:space:]]*=' "$CODEX_CONFIG" | tr -d ' ' | head -1)"
+  fi
+  tmux_bin=$(find_tmux) || { printf 'tmux: not found\n'; return; }
+  printf '\nlive panes with state (server %s):\n' "$("$tmux_bin" display -p '#{pid}' 2>/dev/null || echo none)"
+  "$tmux_bin" list-panes -a -F "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command} state=#{${O}state} kind=#{${O}kind} proj=#{${O}project} subs=#{${O}subagents} eff=#{E:${O}pstate} remote=#{${O}r_host}/#{${O}r_worst} sidebar=#{${O}sidebar}" 2>/dev/null \
+    | grep -E 'state=[a-z]|remote=[^/]|sidebar=1' || printf '  (none)\n'
+  base=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
+  base=${base%/}/agentmux-${USER:-${LOGNAME:-u}}
+  printf '\nscratch: %s\n' "$base"
+  [ -d "$base" ] || return 0
+  for srv in "$base"/*; do
+    [ -d "$srv" ] || continue
+    pid=${srv##*/}
+    alive=yes
+    case $pid in
+    nosrv) alive=n/a ;;
+    *) kill -0 "$pid" 2>/dev/null || alive=dead ;;
+    esac
+    printf '  %s (%s)\n' "$pid" "$alive"
+    if [ "$alive" = dead ] && [ "$gc" = 1 ]; then rm -rf "$srv"; printf '    removed\n'; continue; fi
+    for d in "$srv"/*; do
+      [ -d "$d" ] || continue
+      st=""; [ -r "$d/state" ] && read -r st <"$d/state"
+      printf '    %s state=%s\n' "${d##*/}" "$st"
+    done
+  done
+}
+
+# -------------------------------------------------------------------- sidebar ----
+
+tmux_bin=""
+need_tmux() { tmux_bin=$(find_tmux) || die "tmux not found"; }
+
+# ensure lock: mkdir is atomic on every platform we care about; a stale lock (>10 s) is reclaimed.
+lock_dir() {
+  base=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
+  base=${base%/}/agentmux-${USER:-${LOGNAME:-u}}
+  mkdir -p "$base" 2>/dev/null
+  printf '%s/sb.lock.%s' "$base" "$("$tmux_bin" display -p '#{pid}' 2>/dev/null || echo 0)"
+}
+lock() {
+  l=$(lock_dir)
+  if ! mkdir "$l" 2>/dev/null; then
+    if [ -n "$(find "$l" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then rmdir "$l" 2>/dev/null; mkdir "$l" 2>/dev/null || return 1
+    else return 1
+    fi
+  fi
+  trap 'rmdir "$l" 2>/dev/null' EXIT
+}
+
+F_SB_PANE="#{E:${O}sb_pane}"
+sb_pane() { "$tmux_bin" display -p "$F_SB_PANE" 2>/dev/null; }
+
+cmd_ensure() {
+  need_tmux
+  [ "$("$tmux_bin" show -gqv "${O}on")" = 1 ] || return 0
+  lock || return 0
+  [ -z "$(sb_pane)" ] || return 0
+  # Kill stale unmarked renderers (e.g. restored by tmux-resurrect before the plugin loaded
+  # then superseded) so there is never more than one.
+  "$tmux_bin" list-panes -a -F "#{pane_id} #{${O}sidebar} #{pane_title}" 2>/dev/null | while read -r pid mark title; do
+    [ "$title" = "$AGENTMUX_SIDEBAR_TITLE" ] && [ -z "$mark" ] && "$tmux_bin" kill-pane -t "$pid" 2>/dev/null
+  done
+  # Formats go through variables: bash 3.2 mis-parses nested #{..} inside "$(...)".
+  f_win="#{E:${O}tgt_win}" f_zoom="#{E:${O}tgt_zoom}" f_wide="#{E:${O}tgt_wide}"
+  win=$("$tmux_bin" display -p "$f_win" 2>/dev/null)
+  zoom=$("$tmux_bin" display -p "$f_zoom" 2>/dev/null)
+  wide=$("$tmux_bin" display -p "$f_wide" 2>/dev/null)
+  if [ -z "$win" ]; then
+    win=$("$tmux_bin" list-clients -F '#{?client_control_mode,,#{window_id}}' 2>/dev/null | grep -m1 .)
+    [ -n "$win" ] || return 0
+    zoom=$("$tmux_bin" display -p -t "$win" '#{window_zoomed_flag}' 2>/dev/null)
+    wide=1
+  fi
+  [ "$zoom" = 1 ] && return 0
+  [ "$wide" = 0 ] && return 0
+  width=$("$tmux_bin" show -gqv "${O}width"); width=${width:-46}
+  bg=$("$tmux_bin" show -gqv "${O}color_sidebar_bg"); bg=${bg:-default}
+  py=$(command -v python3 2>/dev/null) || die "python3 not found"
+  new=$("$tmux_bin" split-window -bdfh -l "$width" -t "$win" -P -F '#{pane_id}' \
+    "exec $py $PLUGIN_DIR/bin/agentmux-sidebar") || return 1
+  "$tmux_bin" set -p -t "$new" "${O}sidebar" 1 \; \
+    select-pane -d -t "$new" \; \
+    select-pane -T "$AGENTMUX_SIDEBAR_TITLE" -t "$new" \; \
+    set -p -t "$new" window-style "bg=$bg" \; \
+    set -p -t "$new" window-active-style "bg=$bg"
+}
+
+cmd_toggle() {
+  need_tmux
+  client=${1:-}
+  sb=$(sb_pane)
+  if [ -n "$sb" ]; then
+    "$tmux_bin" set -g "${O}on" 0 \; kill-pane -t "$sb"
+  else
+    "$tmux_bin" set -g "${O}on" 1
+    [ -n "$client" ] && "$tmux_bin" set -g "${O}owner" "$client"
+    cmd_ensure
+  fi
+}
+
+cmd_title_changed() {
+  [ -n "${1:-}" ] || die "title-changed: pane id required"
+  py=$(command -v python3 2>/dev/null) || exit 0
+  exec "$py" "$PLUGIN_DIR/agentmux/title_changed.py" "$1"
+}
+
+# ------------------------------------------------------------------------ notify ----
+
+cmd_notify() {
+  title=${1:-agentmux}
+  body=${2:-}
+  case $(uname -s 2>/dev/null) in
+  Darwin)
+    if have terminal-notifier; then
+      terminal-notifier -title "$title" -message "$body" -group agentmux >/dev/null 2>&1
+    elif have osascript; then
+      esc_t=$(printf '%s' "$title" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      esc_b=$(printf '%s' "$body" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      osascript -e "display notification \"$esc_b\" with title \"$esc_t\"" >/dev/null 2>&1
+    fi
+    ;;
+  Linux)
+    [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+    if have notify-send; then notify-send "$title" "$body" >/dev/null 2>&1
+    elif have dunstify; then dunstify "$title" "$body" >/dev/null 2>&1
+    fi
+    ;;
+  esac
+  return 0
+}
+
+# -------------------------------------------------------------------------- main ----
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+install-hooks) cmd_install_hooks "$@" ;;
+uninstall-hooks) cmd_uninstall_hooks "$@" ;;
+status) cmd_status "$@" ;;
+toggle) cmd_toggle "$@" ;;
+ensure) cmd_ensure "$@" ;;
+title-changed) cmd_title_changed "$@" ;;
+notify) cmd_notify "$@" ;;
+"" | -h | --help | help)
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  ;;
+*) die "unknown command: $cmd (try --help)" ;;
+esac

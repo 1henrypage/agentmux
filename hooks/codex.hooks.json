@@ -1,0 +1,43 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [{ "type": "command", "command": "__HOOK__ codex SessionStart", "timeout": 5 }]
+      }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ codex SessionEnd", "timeout": 5 }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ codex UserPromptSubmit", "timeout": 5 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ codex Stop", "timeout": 5 }] }
+    ],
+    "Interrupt": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ codex Interrupt", "timeout": 5 }] }
+    ],
+    "SubagentStart": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ codex SubagentStart", "timeout": 5 }] }
+    ],
+    "SubagentStop": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ codex SubagentStop", "timeout": 5 }] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ codex PermissionRequest", "timeout": 5 }] }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "request_user_input",
+        "hooks": [{ "type": "command", "command": "__HOOK__ codex PreToolUse", "timeout": 5 }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "shell|exec_command|apply_patch|request_user_input|mcp",
+        "hooks": [{ "type": "command", "command": "__HOOK__ codex PostToolUse", "timeout": 5 }]
+      }
+    ]
+  }
+}

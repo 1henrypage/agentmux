@@ -1,0 +1,52 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [{ "type": "command", "command": "__HOOK__ claude SessionStart", "timeout": 5 }]
+      }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ claude SessionEnd", "timeout": 5 }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ claude UserPromptSubmit", "timeout": 5 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ claude Stop", "timeout": 5 }] }
+    ],
+    "SubagentStart": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ claude SubagentStart", "timeout": 5 }] }
+    ],
+    "SubagentStop": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ claude SubagentStop", "timeout": 5 }] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [{ "type": "command", "command": "__HOOK__ claude PermissionRequest", "timeout": 5 }] }
+    ],
+    "Notification": [
+      {
+        "matcher": "elicitation_dialog|elicitation_url_dialog|agent_needs_input|idle_prompt",
+        "hooks": [{ "type": "command", "command": "__HOOK__ claude Notification", "timeout": 5 }]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion|ExitPlanMode",
+        "hooks": [{ "type": "command", "command": "__HOOK__ claude PreToolUse", "timeout": 5 }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^(?!(Read|Grep|Glob|LS|TodoWrite|ToolSearch|BashOutput|Monitor|TaskCreate|TaskUpdate|TaskList|TaskGet|Skill)$).*",
+        "hooks": [{ "type": "command", "command": "__HOOK__ claude PostToolUse", "timeout": 5 }]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "^(?!(Read|Grep|Glob|LS|TodoWrite|ToolSearch|BashOutput|Monitor|TaskCreate|TaskUpdate|TaskList|TaskGet|Skill)$).*",
+        "hooks": [{ "type": "command", "command": "__HOOK__ claude PostToolUseFailure", "timeout": 5 }]
+      }
+    ]
+  }
+}

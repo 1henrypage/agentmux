@@ -1,0 +1,1 @@
+{"session_id":"sess-codex-1","cwd":"/Users/x/projects/demo","transcript_path":"/Users/x/.codex/sessions/s.jsonl","model":"gpt-5","hook_event_name":"PreToolUse","tool_name":"request_user_input","tool_input":{"questions":[]},"tool_use_id":"call_q1"}

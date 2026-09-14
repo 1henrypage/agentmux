@@ -1,0 +1,12 @@
+ agents                    󰸇 1 󰄬 1 󰀐 1 ● 2 · 1
+──────────────────────────────────────────────
+ 󰌢 local                                      
+  󰄬 work:1.1 herdr:codex                      
+  󰀐 3:2.1    omnigent:claude            1h02m 
+  ● 3:1.1    .dotfiles:claude           3m05s 
+  · work:3.2 old:claude                       
+ 󰒋 devbox                                     
+  󰸇 main:2.1 api-server:claude         12m34s 
+  ● main:3.1 web:codex                  1m01s 
+                                              
+                                              

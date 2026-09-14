@@ -1,0 +1,8 @@
+ agents                    󰸇 1 󰄬 1 󰀐 1 ● 2 · 1
+──────────────────────────────────────────────
+ 󰌢 local                                      
+  󰄬 work:1.1 herdr:codex                      
+    finished 3m ago                           
+  󰀐 3:2.1    omnigent:claude            1h02m 
+    󰀐 3 · Explore                             
+ +4 more                                      

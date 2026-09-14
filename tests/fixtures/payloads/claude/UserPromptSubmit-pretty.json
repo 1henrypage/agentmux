@@ -1,0 +1,8 @@
+{
+  "session_id": "sess-claude-1",
+  "transcript_path": "/Users/x/.claude/projects/p/sess.jsonl",
+  "cwd": "/Users/x/projects/demo/src",
+  "permission_mode": "default",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "say \"hi\" \\ then\nstop"
+}

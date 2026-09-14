@@ -1,0 +1,7 @@
+%1	$0	3	@1	1	claude	1	0	1	1	0	claude	x			working	claude	.dotfiles	1799999815	0	implement the plan	s1	1799999995	laptop			
+%2	$0	3	@2	2	codex	1	0	1	1	0	codex	x			delegating	claude	omnigent	1799996275	3	Explore	s2	1799999980	laptop			
+%3	$1	work	@3	1	Python	1	0	1	1	0	Python	x			done	codex	herdr		0	add tests	s3	1799999800	laptop			
+%4	$1	work	@4	2	zsh	1	0	1	1	0	zsh	x			working	claude	stale	1799999901	0	killed agent	s4	1799999100	laptop			
+%5	$1	work	@5	3	ssh	1	0	1	1	0	ssh	AGX1|h=devbox|t=30000000|hb=60~h=devbox|s=blocked|k=claude|p=api-server|b=1799999246|n=0|u=1799999997|x=0|w=main:2.1|d=permission Bash~h=devbox|s=working|k=codex|p=web|b=1799999939|n=1|u=1799999990|x=1|w=main:3.1|d=refactor the parser~														1800000100
+%6	$1	work	@5	3	ssh	2	0	1	1	0	zsh	Henrys-MacBook-Pro.local			idle	claude	old					1799999997				
+%9	$0	3	@1	1	claude	2	0	1	1	0	python3	agentmux-sidebar												1		

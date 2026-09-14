@@ -1,0 +1,573 @@
+#!/bin/sh
+# agentmux-hook <kind> [<event>]  -  agent hook (JSON on stdin) -> tmux pane options.
+#
+# kind  : claude | codex
+# event : optional hint of hook_event_name (lets PostToolUse exit before reading stdin)
+#
+# Hot path: POSIX sh builtins only, no jq, at most two tmux round-trips. Everything runs
+# under `2>/dev/null` and the script always exits 0 so a broken hook can never block an agent.
+# Sources nothing; lib/constants.sh duplicates the constants below and a test asserts equality.
+#
+# Data contract (docs/CONTRACT.md): the scratch dir is the source of truth, pane options are a
+# projection of it. All marker operations are builtins (`printf '' > f`, `read < f`,
+# `set -- subs/*`) so concurrent hooks need no locks. Never use `: > f` here: `:` is a special
+# builtin and a failed redirection on it aborts a non-interactive sh.
+
+AGX_OPT=@agentmux_
+AGX_MAGIC=AGX1
+AGX_SAN_MAX=24
+AGX_REDRAW=agentmux-redraw
+
+# Byte semantics everywhere: under a UTF-8 locale bash treats [a-z] as a collation range that
+# swallows accented letters, and `?` in ${s#?} would consume a whole multibyte character.
+LC_ALL=C
+export LC_ALL
+
+# ----------------------------------------------------------------------------- helpers ----
+
+# First top-level value for key $1 in $input -> $v. Agents emit the common fields before
+# tool_input, so the first occurrence is the top-level one. Strings containing backslash
+# escapes go through jq when available (rare: only free text like prompts).
+jget() {
+  v=""
+  case $input in *"\"$1\""*) ;; *) return 1 ;; esac
+  v=${input#*\""$1"\"}
+  v=${v#"${v%%[!	 ]*}"}
+  case $v in :*) v=${v#:} ;; *) v=""; return 1 ;; esac
+  v=${v#"${v%%[!	 ]*}"}
+  case $v in
+  \"*)
+    v=${v#\"}
+    r=${v%%\"*}
+    case $r in
+    *\\*) jget_escaped "$1" ;;
+    *) v=$r ;;
+    esac
+    ;;
+  *)
+    v=${v%%[,\}]*}
+    v=${v%"${v##*[!	 ]}"}
+    case $v in null) v="" ;; esac
+    ;;
+  esac
+  [ -n "$v" ]
+}
+
+jget_escaped() {
+  if [ -n "$jq_bin" ]; then
+    # shellcheck disable=SC2016
+    v=$(printf '%s' "$input" | "$jq_bin" -r --arg k "$1" '.[$k] // empty | tostring' 2>/dev/null)
+    return
+  fi
+  # Best effort without jq: walk to the first unescaped quote, unescape \" \\ \n \t.
+  rest=${input#*\""$1"\"}
+  rest=${rest#*\"}
+  acc=""
+  while :; do
+    seg=${rest%%\"*}
+    [ "$seg" = "$rest" ] && { acc="$acc$seg"; break; }
+    rest=${rest#*\"}
+    case $seg in
+    *\\\\) acc="$acc${seg%\\\\}\\"; break ;;
+    *\\) acc="$acc${seg%\\}\"" ;;
+    *) acc="$acc$seg"; break ;;
+    esac
+  done
+  v=""
+  while [ -n "$acc" ]; do
+    case $acc in
+    \\n* | \\t* | \\r*) v="$v "; acc=${acc#??} ;;
+    \\\\*) v="$v\\"; acc=${acc#??} ;;
+    \\*) acc=${acc#?} ;;
+    *) c=${acc%"${acc#?}"}; v="$v$c"; acc=${acc#?} ;;
+    esac
+  done
+}
+
+# san STRING MAX [sp] -> $san_out : [A-Za-z0-9_.-] (plus space with `sp`), runs of anything
+# else collapse to one `_`, at most MAX characters consumed.
+san() {
+  s=$1
+  max=${2:-$AGX_SAN_MAX}
+  san_out=""
+  n=0
+  last=""
+  while [ -n "$s" ] && [ "$n" -lt "$max" ]; do
+    c=${s%"${s#?}"}
+    s=${s#?}
+    case $c in
+    [A-Za-z0-9_.-]) san_out="$san_out$c"; last=$c ;;
+    ' ')
+      if [ "${3:-}" = sp ]; then
+        [ "$last" = ' ' ] || san_out="$san_out "
+        last=' '
+      else
+        [ "$last" = _ ] || san_out="${san_out}_"
+        last=_
+      fi
+      ;;
+    *)
+      [ "$last" = _ ] || san_out="${san_out}_"
+      last=_
+      ;;
+    esac
+    n=$((n + 1))
+  done
+  san_out=${san_out#_}
+  san_out=${san_out%_}
+  san_out=${san_out# }
+  san_out=${san_out% }
+}
+
+# read_file NAME -> $rf (first line, "" when missing)
+read_file() {
+  rf=""
+  [ -r "$dir/$1" ] || return 1
+  read -r rf <"$dir/$1" || :
+}
+
+put() { printf '%s\n' "$2" >"$dir/$1"; }
+clear_file() { printf '' >"$dir/$1"; }
+
+count_live() {
+  live=0
+  set -- "$dir/subs/$gen".*.s
+  [ -e "$1" ] || return 0
+  for f in "$@"; do
+    [ -e "${f%.s}.e" ] || live=$((live + 1))
+  done
+}
+
+# derive -> $state from the markers. blocked > running > live subagents > done/idle.
+derive() {
+  read_file blocked; b=$rf
+  read_file main; m=$rf
+  count_live
+  if [ -n "$b" ]; then state=blocked
+  elif [ "$m" = running ]; then state=working
+  elif [ "$live" -gt 0 ]; then state=delegating
+  elif [ -s "$dir/start" ]; then state="done"
+  else state=idle
+  fi
+}
+
+is_shell() {
+  case ${1#-} in zsh | bash | fish | sh | dash | ksh | nu) return 0 ;; esac
+  return 1
+}
+
+# --------------------------------------------------------------------- display pane ----
+
+find_tmux() {
+  tmux_bin=$(command -v tmux 2>/dev/null)
+  [ -n "$tmux_bin" ] && return 0
+  for c in /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux; do
+    [ -x "$c" ] && { tmux_bin=$c; return 0; }
+  done
+  return 1
+}
+
+# tm CMD... -> run tmux against the display server (outer socket when hopping).
+tm() {
+  if [ -n "$outer_sock" ]; then "$tmux_bin" -S "$outer_sock" "$@"; else "$tmux_bin" "$@"; fi
+}
+
+# Search the given server sockets for a pane whose tty is $ctty -> $outer_sock/$outer_pane.
+search_servers() {
+  for s in "$@"; do
+    [ -S "$s" ] || continue
+    [ "$s" = "$cur" ] && continue
+    hit=$("$tmux_bin" -S "$s" list-panes -a -F "#{pane_tty} #{pane_id}" 2>/dev/null) || continue
+    case "
+$hit" in
+    *"
+$ctty "*)
+      p=${hit#*"
+$ctty "}
+      p=${p%%
+*}
+      case $hit in "$ctty "*) p=${hit#"$ctty "}; p=${p%%
+*} ;; esac
+      outer_sock=$s
+      outer_pane=$p
+      return 0
+      ;;
+    esac
+  done
+  return 1
+}
+
+# Hop from a private (omnigent) server to the pane that displays it, depth <= 3.
+# Result: mode=hop (outer_sock, outer_pane, ctty) | title (ctty) | none (web-only).
+resolve_hop() {
+  cur=$sock
+  depth=0
+  while [ "$depth" -lt 3 ]; do
+    ctty=$("$tmux_bin" -S "$cur" list-clients -F '#{?client_control_mode,,#{client_tty}}' 2>/dev/null)
+    ctty=${ctty#"${ctty%%[!
+]*}"}
+    ctty=${ctty%%
+*}
+    if [ -z "$ctty" ]; then mode=none; return; fi
+    if search_servers "${TMUX_TMPDIR:-/tmp}"/tmux-*/*; then mode=hop; return; fi
+    if search_servers "${TMPDIR:-/tmp}"/omnigent-terminal-*/tmux.sock; then
+      cur=$outer_sock
+      depth=$((depth + 1))
+      continue
+    fi
+    mode=title
+    return
+  done
+  mode=title
+}
+
+# Decide how this agent is displayed. Sets $mode and, for direct/hop, $pane (+ $outer_sock).
+resolve_display() {
+  mode=""
+  outer_sock=""
+  sock=${TMUX%%,*}
+  if [ -z "$TMUX" ]; then mode=bare; return; fi
+  case $sock in
+  */tmux-[0-9]*/*) mode=direct; pane=$TMUX_PANE; return ;;
+  esac
+  if [ "$force_resolve" != 1 ] && read_file outer; then
+    outer_sock=${rf%%|*}
+    r=${rf#*|}
+    outer_pane=${r%%|*}
+    ctty=${r#*|}
+    if [ -S "$outer_sock" ] && [ -n "$outer_pane" ]; then mode=hop; pane=$outer_pane; return; fi
+    outer_sock=""
+  fi
+  resolve_hop
+  case $mode in
+  hop) put outer "$outer_sock|$outer_pane|$ctty"; pane=$outer_pane ;;
+  *) outer_sock=""; rm -f "$dir/outer" ;;
+  esac
+}
+
+# One read round-trip against the display server. Sets ptty wact satt pcmd host now
+# notify notify_done clients. Returns 1 when the pane is gone.
+read_pane() {
+  info=$(tm display -p -t "$pane" \
+    "#{pane_tty}|#{window_active}|#{session_attached}|#{pane_current_command}|#{?#{${AGX_OPT}hostname},#{${AGX_OPT}hostname},#{host_short}}|%s|#{${AGX_OPT}notify}|#{${AGX_OPT}notify_done}" \; \
+    list-clients -F '#{?client_control_mode,,#{client_name}}' 2>/dev/null) || return 1
+  line=${info%%
+*}
+  clients=${info#*
+}
+  [ "$clients" = "$info" ] && clients=""
+  ptty=${line%%|*}; line=${line#*|}
+  wact=${line%%|*}; line=${line#*|}
+  satt=${line%%|*}; line=${line#*|}
+  pcmd=${line%%|*}; line=${line#*|}
+  host=${line%%|*}; line=${line#*|}
+  now=${line%%|*}; line=${line#*|}
+  notify=${line%%|*}; line=${line#*|}
+  notify_done=$line
+  [ -n "$now" ]
+}
+
+# Time + host without a display server: two forks, once per event, cold paths only.
+bare_clock() {
+  now=$(date +%s)
+  # shellcheck disable=SC3028
+  h=${HOSTNAME:-}
+  [ -n "$h" ] || { read -r h </proc/sys/kernel/hostname; } 2>/dev/null || h=""
+  [ -n "$h" ] || h=$(hostname 2>/dev/null)
+  host=${h%%.*}
+}
+
+emit_title() {
+  # $1 = tty device, $2 = entry ("" for an empty aggregate)
+  [ -w "$1" ] || return 0
+  printf '\033]2;%s|h=%s|t=%s|hb=0~%s\007' "$AGX_MAGIC" "$host" "$((now / 60))" "$2" >"$1"
+}
+
+# ------------------------------------------------------------------------------ main ----
+
+main() {
+  kind=$1
+  ev=$2
+  case $kind in claude | codex) ;; *) return ;; esac
+  case ${CLAUDE_CODE_ENTRYPOINT:-cli} in cli) ;; *) return ;; esac
+
+  base=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
+  base=${base%/}/agentmux-${USER:-${LOGNAME:-u}}
+  key=""
+  if [ -n "$TMUX" ] && [ -n "$TMUX_PANE" ]; then
+    p=${TMUX#*,}
+    key=${p%%,*}/${TMUX_PANE#%}
+  fi
+  dir=$base/$key
+
+  # PostToolUse only matters while blocked: skip the stdin read entirely otherwise.
+  case $ev in
+  PostToolUse*) if [ -n "$key" ] && ! [ -s "$dir/blocked" ]; then return; fi ;;
+  esac
+
+  input=""
+  line=""
+  while IFS= read -r line; do input="$input$line"; done
+  input="$input$line"
+
+  jq_bin=$(command -v jq 2>/dev/null)
+
+  jget hook_event_name; event=$v
+  [ -n "$event" ] || event=$ev
+  jget session_id; sid=$v
+  jget cwd; cwd=$v
+  jget tool_name; tool=$v
+  jget tool_use_id; tuid=$v
+  jget agent_id; aid=$v
+  jget notification_type; ntype=$v
+  jget source; source=$v
+  jget prompt; prompt=$v
+
+  if [ -z "$key" ]; then
+    san "$sid" 40
+    key=nosrv/${san_out:-anon}
+    dir=$base/$key
+  fi
+  case $ev in
+  PostToolUse*) [ -s "$dir/blocked" ] || return ;;
+  esac
+
+  case $event in
+  SessionStart)
+    case $source in compact | fork) return ;; esac
+    rm -rf "$dir"
+    ;;
+  esac
+  [ -d "$dir/subs" ] || mkdir -p "$dir/subs" || return
+
+  read_file gen; gen=${rf:-0}
+
+  # Project name, no git fork: $CLAUDE_PROJECT_DIR, else nearest .git above cwd, else cwd.
+  proj=""
+  if [ -n "$CLAUDE_PROJECT_DIR" ]; then
+    proj=${CLAUDE_PROJECT_DIR##*/}
+  elif [ -n "$cwd" ]; then
+    d=$cwd
+    while [ -n "$d" ] && [ "$d" != / ]; do
+      if [ -e "$d/.git" ]; then proj=${d##*/}; break; fi
+      d=${d%/*}
+    done
+    [ -n "$proj" ] || proj=${cwd##*/}
+  fi
+  san "$proj"; proj=$san_out
+
+  # ---- apply the event to the markers -------------------------------------------------
+  force_resolve=0
+  notify_kind=""
+  case $event in
+  SessionStart)
+    put gen 0; gen=0
+    put main stopped
+    clear_file blocked
+    clear_file start
+    clear_file detail
+    force_resolve=1
+    ;;
+  UserPromptSubmit)
+    gen=$((gen + 1)); put gen "$gen"
+    put main running
+    clear_file blocked
+    san "$prompt" 24 sp; put detail "$san_out"
+    put start NOW
+    force_resolve=1
+    ;;
+  PreToolUse)
+    case $tool in
+    AskUserQuestion | request_user_input) put blocked "question|$tool|$tuid" ;;
+    ExitPlanMode) put blocked "plan review|$tool|$tuid" ;;
+    *) return ;;
+    esac
+    ;;
+  PermissionRequest)
+    put blocked "permission ${tool:-?}|$tool|$tuid"
+    ;;
+  Notification)
+    case $ntype in
+    elicitation_dialog | elicitation_url_dialog) put blocked "elicitation||" ;;
+    agent_needs_input) put blocked "agent input||" ;;
+    idle_prompt)
+      derive
+      [ "$state" = working ] || return
+      put main stopped
+      ;;
+    *) return ;;
+    esac
+    ;;
+  PostToolUse | PostToolUseFailure)
+    read_file blocked; b=$rf
+    [ -n "$b" ] || return
+    rid=${b##*|}
+    rtool=${b#*|}; rtool=${rtool%%|*}
+    if [ -n "$rid" ] && [ "$rid" = "$tuid" ]; then clear_file blocked
+    elif [ -z "$rid" ] && { [ -z "$rtool" ] || [ "$rtool" = "$tool" ]; }; then clear_file blocked
+    elif [ -z "$aid" ]; then clear_file blocked # main agent moved on (e.g. after a denial)
+    else return
+    fi
+    ;;
+  Stop)
+    put main stopped
+    clear_file blocked
+    ;;
+  SubagentStart)
+    [ -n "$aid" ] || { count_live; aid=anon$((live + 1)); }
+    san "$aid" 40; aid=$san_out
+    printf '' >"$dir/subs/$gen.$aid.s"
+    put main running
+    ;;
+  SubagentStop)
+    if [ -n "$aid" ]; then
+      san "$aid" 40; aid=$san_out
+      [ -e "$dir/subs/$gen.$aid.s" ] || printf '' >"$dir/subs/$gen.$aid.s"
+      printf '' >"$dir/subs/$gen.$aid.e"
+    else
+      set -- "$dir/subs/$gen".*.s
+      for f in "$@"; do
+        [ -e "$f" ] || continue
+        [ -e "${f%.s}.e" ] && continue
+        printf '' >"${f%.s}.e"
+        break
+      done
+    fi
+    read_file main; m=$rf
+    count_live
+    if [ "$m" = stopped ] && [ "$live" -eq 0 ]; then
+      put main running
+      put detail resuming
+    fi
+    ;;
+  Interrupt)
+    put main stopped
+    clear_file blocked
+    clear_file start
+    ;;
+  SessionEnd) ;;
+  *) return ;;
+  esac
+
+  derive
+  read_file state; prev=$rf
+  put state "$state"
+
+  # ---- find the pane that displays this agent ------------------------------------------
+  tmux_bin=""
+  outer_sock=""
+  find_tmux || :
+  if [ -n "$tmux_bin" ]; then resolve_display; else mode=bare; fi
+
+  case $mode in
+  direct | hop)
+    if ! read_pane; then
+      [ "$mode" = hop ] || return
+      force_resolve=1; resolve_display; [ "$mode" = hop ] || return
+      read_pane || return
+    fi
+    if [ "$mode" = hop ] && [ "$force_resolve" != 1 ] && { [ "$ptty" != "$ctty" ] || is_shell "$pcmd"; }; then
+      force_resolve=1; resolve_display; [ "$mode" = hop ] || return
+      read_pane || return
+    fi
+    ;;
+  title)
+    now=$("$tmux_bin" display -p "%s|#{?#{${AGX_OPT}hostname},#{${AGX_OPT}hostname},#{host_short}}" 2>/dev/null)
+    host=${now#*|}; now=${now%%|*}
+    [ -n "$now" ] || bare_clock
+    ;;
+  bare)
+    if [ -n "$SSH_CONNECTION$SSH_TTY" ] || [ "$AGENTMUX_TITLE" = 1 ]; then bare_clock; else return; fi
+    ;;
+  none)
+    read_file start
+    [ "$rf" = NOW ] && { bare_clock; put start "$now"; }
+    return
+    ;;
+  esac
+
+  # ---- values to publish ----------------------------------------------------------------
+  read_file start; start=$rf
+  if [ "$start" = NOW ]; then start=$now; put start "$now"; fi
+  case $state in idle | done) pub_start="" ;; *) pub_start=$start ;; esac
+  read_file blocked; b=$rf
+  if [ -n "$b" ]; then detail=${b%%|*}; else read_file detail; detail=$rf; fi
+  count_live
+  viewed=0
+  [ "${wact:-0}" = 1 ] && [ "${satt:-0}" != 0 ] && viewed=1
+  pub_state=$state
+  [ "$state" = "done" ] && [ "$viewed" = 1 ] && pub_state=idle
+
+  if [ "$prev" != "$state" ] && [ "$viewed" = 0 ]; then
+    case $state in
+    blocked) [ "$notify" = off ] || notify_kind=blocked ;;
+    "done") case $prev in working | delegating | blocked) [ "$notify_done" = off ] || notify_kind="done" ;; esac ;;
+    esac
+  fi
+
+  # ---- one write round-trip -------------------------------------------------------------
+  case $mode in
+  direct | hop)
+    set --
+    if [ "$event" = SessionEnd ]; then
+      for o in state kind project start subagents detail sid updated host; do
+        set -- "$@" set -pu -t "$pane" "$AGX_OPT$o" \;
+      done
+    else
+      set -- "$@" \
+        set -p -t "$pane" "${AGX_OPT}state" "$pub_state" \; \
+        set -p -t "$pane" "${AGX_OPT}kind" "$kind" \; \
+        set -p -t "$pane" "${AGX_OPT}project" "$proj" \; \
+        set -p -t "$pane" "${AGX_OPT}start" "$pub_start" \; \
+        set -p -t "$pane" "${AGX_OPT}subagents" "$live" \; \
+        set -p -t "$pane" "${AGX_OPT}detail" "$detail" \; \
+        set -p -t "$pane" "${AGX_OPT}sid" "$sid" \; \
+        set -p -t "$pane" "${AGX_OPT}updated" "$now" \; \
+        set -p -t "$pane" "${AGX_OPT}host" "$host" \;
+    fi
+    oldifs=$IFS
+    IFS='
+'
+    for c in $clients; do
+      [ -n "$c" ] && set -- "$@" refresh-client -S -t "$c" \;
+    done
+    IFS=$oldifs
+    set -- "$@" wait-for -S "$AGX_REDRAW"
+    tm "$@" >/dev/null 2>&1
+    ;;
+  title | bare)
+    tty=/dev/tty
+    [ "$mode" = title ] && tty=$ctty
+    if [ "$event" = SessionEnd ]; then
+      emit_title "$tty" ""
+    else
+      san "$detail" 32 sp
+      emit_title "$tty" "h=$host|s=$pub_state|k=$kind|p=$proj|b=$pub_start|n=$live|u=$now|x=1|w=|d=$san_out~"
+    fi
+    ;;
+  esac
+
+  if [ "$event" = SessionEnd ]; then
+    rm -rf "$dir"
+    return
+  fi
+
+  if [ -n "$notify_kind" ] && [ "$mode" != title ] && [ "$mode" != bare ]; then
+    case $kind in claude) pretty="Claude Code" ;; *) pretty=Codex ;; esac
+    case $notify_kind in
+    blocked) body="${proj:-agent} needs you: $detail" ;;
+    *) body="${proj:-agent} is done" ;;
+    esac
+    case $0 in */*) hookdir=${0%/*} ;; *) hookdir=. ;; esac
+    "$hookdir/../bin/agentmux" notify "$pretty" "$body" >/dev/null 2>&1 &
+  fi
+}
+
+if [ "${AGENTMUX_HOOK_LIB:-0}" = 1 ]; then
+  # Sourced by tests: expose the functions, run nothing.
+  :
+else
+  trap 'exit 0' EXIT
+  { main "$@"; } 2>/dev/null
+  exit 0
+fi

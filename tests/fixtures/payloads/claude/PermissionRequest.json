@@ -1,0 +1,1 @@
+{"session_id":"sess-claude-1","transcript_path":"/Users/x/.claude/projects/p/sess.jsonl","cwd":"/Users/x/projects/demo/src","permission_mode":"default","hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"rm -rf build","description":"clean, \"tool_use_id\": fake"},"tool_use_id":"toolu_perm_1"}

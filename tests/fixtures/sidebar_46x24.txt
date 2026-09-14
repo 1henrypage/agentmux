@@ -1,0 +1,24 @@
+ agents                    󰸇 1 󰄬 1 󰀐 1 ● 2 · 1
+──────────────────────────────────────────────
+ 󰌢 local                                      
+  󰄬 work:1.1 herdr:codex                      
+    finished 3m ago                           
+  󰀐 3:2.1    omnigent:claude            1h02m 
+    󰀐 3 · Explore                             
+  ● 3:1.1    .dotfiles:claude           3m05s 
+    implement the plan                        
+  · work:3.2 old:claude                       
+    idle                                      
+ 󰒋 devbox                                     
+  󰸇 main:2.1 api-server:claude         12m34s 
+    needs you · permission Bash               
+  ● main:3.1 web:codex                  1m01s 
+    refactor the parser · 󰀐 1                 
+                                              
+                                              
+                                              
+                                              
+                                              
+                                              
+                                              
+                                              
