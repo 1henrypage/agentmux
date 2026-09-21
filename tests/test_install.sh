@@ -13,6 +13,20 @@ assert_eq() { if [ "$2" = "$3" ]; then ok; else ko "$1: expected [$2] got [$3]";
 assert_grep() { if grep -q -- "$2" "$3"; then ok; else ko "$1: [$2] not found in $3"; fi; }
 assert_nogrep() { if grep -q -- "$2" "$3"; then ko "$1: [$2] unexpectedly found in $3"; else ok; fi; }
 
+check_feature_case() { # suite label key value
+  suite=$1 case_name=$2 key=$3 value=$4
+  expected="$key = true # keep $case_name"
+  printf '[features]\n%s = %s # keep %s\n\n[model]\nname = "x"\n' \
+    "$key" "$value" "$case_name" >"$CODEX_HOME/config.toml"
+  "$ROOT/bin/agentmux" install-hooks --hook-path /opt/agentmux/hooks/agentmux-hook >/dev/null 2>&1
+  assert_eq "$suite $case_name enabled in place" "$expected" "$(sed -n 2p "$CODEX_HOME/config.toml")"
+  python3 -c 'import sys,tomllib; d=tomllib.load(open(sys.argv[1], "rb")); assert d["features"]["hooks"] is True' \
+    "$CODEX_HOME/config.toml" && ok || ko "$suite $case_name valid TOML"
+  cp "$CODEX_HOME/config.toml" "$WORK/$case_name.toml"
+  "$ROOT/bin/agentmux" install-hooks --hook-path /opt/agentmux/hooks/agentmux-hook >/dev/null 2>&1
+  cmp -s "$CODEX_HOME/config.toml" "$WORK/$case_name.toml" && ok || ko "$suite $case_name idempotent"
+}
+
 run_suite() { # $1 = label, PATH already arranged
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/agentmux-install.XXXXXX")
   export CLAUDE_CONFIG_DIR="$WORK/claude" CODEX_HOME="$WORK/codex" HOME="$WORK/home"
@@ -56,6 +70,14 @@ import json,sys
 d=json.load(open(sys.argv[1]))
 print(sum(1 for ev in d["hooks"].values() for g in ev for h in g["hooks"] if "agentmux-hook" in h["command"]))' "$S")
   assert_eq "$1 claude entries" 11 "$n"
+  python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+for event in ("PostToolUse", "PostToolUseFailure"):
+    groups=[g for g in d["hooks"][event]
+            if any("agentmux-hook" in h.get("command", "") for h in g.get("hooks", []))]
+    assert groups and all("matcher" not in g for g in groups), event
+' "$S" && ok || ko "$1 Claude completion hooks match every tool"
   n=$(python3 -c '
 import json,sys
 d=json.load(open(sys.argv[1]))
@@ -83,6 +105,15 @@ print(sum(1 for ev in d["hooks"].values() for g in ev for h in g["hooks"] if "ag
   "$ROOT/bin/agentmux" install-hooks --hook-path /opt/agentmux/hooks/agentmux-hook >/dev/null 2>&1
   assert_eq "$1 insert under header" 'hooks = true' "$(sed -n 3p "$CODEX_HOME/config.toml")"
 
+  # Bare and quoted TOML keys are all valid. True is left byte-identical; false is flipped
+  # without changing the key spelling, whitespace, or trailing comment.
+  check_feature_case "$1" bare-true hooks true
+  check_feature_case "$1" double-true '"hooks"' true
+  check_feature_case "$1" single-true "'hooks'" true
+  check_feature_case "$1" bare-false hooks false
+  check_feature_case "$1" double-false '"hooks"' false
+  check_feature_case "$1" single-false "'hooks'" false
+
   # --- symlinked settings survive in place ---
   mv "$S" "$WORK/real-settings.json"; ln -s "$WORK/real-settings.json" "$S"
   "$ROOT/bin/agentmux" uninstall-hooks >/dev/null 2>&1
@@ -96,7 +127,8 @@ import json,sys
 d=json.load(open(sys.argv[1]))
 assert "hooks" not in d, "empty hooks object must be deleted"
 ' "$H" && ok || ko "$1 empty hooks deleted"
-  assert_grep "$1 uninstall leaves config.toml" 'hooks = true' "$CODEX_HOME/config.toml"
+  python3 -c 'import sys,tomllib; d=tomllib.load(open(sys.argv[1], "rb")); assert d["features"]["hooks"] is True' \
+    "$CODEX_HOME/config.toml" && ok || ko "$1 uninstall leaves config.toml"
 
   # --- invalid JSON is refused ---
   printf '{not json' >"$H"

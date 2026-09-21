@@ -48,6 +48,10 @@ viewed). Hooks never cache the state option; they derive it from the scratch mar
 | `@agentmux_r_prev` | last decoded title (skip duplicates) |
 | `@agentmux_r_notified` | `host\|target\|start\|state\|updated` of the last notification (flap guard) |
 
+Every direct or hopped local-agent write unsets the complete `@agentmux_r_*` summary in the
+same tmux transaction. Local pane state is authoritative once a pane stops representing an
+SSH session, even if its old AGX1 pane title has not changed yet.
+
 ## Global options
 
 Set by the user before `run tpm`; the plugin fills in defaults.
@@ -68,7 +72,9 @@ the sidebar follows).
   (`-?(zsh|bash|fish|sh|dash|ksh|nu)`), which self-heals a `kill -9`'d agent. The sidebar
   keeps a row for 15 s after the shell is back so a normal exit does not flicker.
 - A state older than `@agentmux_ttl` renders as idle.
-- A remote summary counts only while `@agentmux_r_exp` is `0` or in the future.
+- A remote summary counts only while the pane title is still AGX1 and `@agentmux_r_exp` is
+  `0` or in the future. Once invalid or expired it supplies no state, label, timer, liveness,
+  or seen bookkeeping and is not forwarded into this server's outgoing AGX1 aggregate.
 - Window badge: ladder over all panes in the window. Label and timer follow the active pane
   when it is a live agent, else the first live agent pane in the window.
 
@@ -86,7 +92,8 @@ Printable ASCII only; `| ~ ; # % ,` never appear inside data (`p`/`d` are saniti
 you would see looking at the pane carrying the title. `hb=60` means the writer re-emits at
 least once a minute (a tmux server running the plugin), `hb=0` a one-shot writer (the hook
 in bare-ssh mode, `w=` empty). A server re-embeds the entries decoded from its own ssh panes
-verbatim, rewriting `x=1` to `x=0` when the embedding pane is not visible.
+only while their remote summary is valid, verbatim, rewriting `x=1` to `x=0` when the
+embedding pane is not visible.
 
 The title is only emitted to a client whose `client_termname` starts with `tmux` or
 `screen` (an inner tmux talking to an outer one); every other client gets the human title

@@ -62,17 +62,20 @@ G_REMOTE='󰐠'    # U+F0420 nf-md-remote
 SG='#{m/r:^-?(zsh|bash|fish|sh|dash|ksh|nu)$,#{pane_current_command}}'
 # Local state, rendered idle once older than @agentmux_ttl.
 LS="#{?#{m:-*,#{e|-|:#{e|+|:#{${O}updated},#{${O}ttl}},%s}},idle,#{${O}state}}"
-# Remote (ssh pane) state, from title-changed's summary while its expiry is in the future.
-RS="#{?#{&&:#{${O}r_exp},#{m:-*,#{e|-|:#{${O}r_exp},%s}}},idle,#{?#{${O}r_seen},#{${O}r_worst2},#{${O}r_worst}}}"
-setg "${O}pstate" "#{?${SG},,#{?#{${O}r_host},${RS},#{?#{${O}state},${LS},}}}"
+# A remote summary is authoritative only while the pane still carries AGX1 and its cached
+# expiry is either the explicit one-shot value 0 or has not passed yet. Empty/malformed
+# expiries are invalid. Every remote consumer below uses this one condition.
+RVALID="#{&&:#{m:${AGENTMUX_MAGIC}|*,#{pane_title}},#{||:#{==:#{${O}r_exp},0},#{&&:#{m/r:^[1-9][0-9]*$,#{${O}r_exp}},#{!:#{m:-*,#{e|-|:#{${O}r_exp},%s}}}}}}"
+RS="#{?#{${O}r_seen},#{${O}r_worst2},#{${O}r_worst}}"
+setg "${O}pstate" "#{?${SG},,#{?${RVALID},${RS},#{?#{${O}state},${LS},}}}"
 # 1 when the pane is a live agent (local or remote), 0 otherwise.
-LIVE="#{&&:#{!:${SG}},#{?#{${O}r_host},1,#{?#{${O}state},1,0}}}"
+LIVE="#{&&:#{!:${SG}},#{?${RVALID},1,#{?#{${O}state},1,0}}}"
 setg "${O}plive" "$LIVE"
-setg "${O}pproj" "#{?#{${O}r_host},#{${O}r_proj},#{${O}project}}"
-setg "${O}pkind" "#{?#{${O}r_host},#{${O}r_kind},#{${O}kind}}"
-setg "${O}pstart" "#{?#{${O}r_host},#{${O}r_start},#{${O}start}}"
-setg "${O}phost" "#{${O}r_host}"
-setg "${O}pdeleg" "#{?#{${O}r_host},#{${O}r_deleg},#{${O}subagents}}"
+setg "${O}pproj" "#{?${RVALID},#{${O}r_proj},#{${O}project}}"
+setg "${O}pkind" "#{?${RVALID},#{${O}r_kind},#{${O}kind}}"
+setg "${O}pstart" "#{?${RVALID},#{${O}r_start},#{${O}start}}"
+setg "${O}phost" "#{?${RVALID},#{${O}r_host},}"
+setg "${O}pdeleg" "#{?${RVALID},#{${O}r_deleg},#{${O}subagents}}"
 
 # ------------------------------------------------------------- per-window ----
 setg "${O}wstates" "#{P:#{E:${O}pstate} }"
@@ -106,7 +109,7 @@ setg "${O}timer" "#{?#{m:?*,#{E:${O}wstart}}, #[fg=#{${O}color_text}]#{E:${O}ela
 # own ssh panes re-embedded verbatim (their x=1 rewritten to x=0 when that pane is hidden).
 SAFE='[^A-Za-z0-9 ._@+()-]'
 VIS="#{&&:#{pane_active},#{&&:#{window_active},#{session_attached}}}"
-ENTRY="#{?${SG},,#{?#{${O}state},h=${HOSTF}|s=${LS}|k=#{${O}kind}|p=#{s/${SAFE}/_/:${O}project}|b=#{${O}start}|n=#{${O}subagents}|u=#{${O}updated}|x=${VIS}|w=#{s/[^A-Za-z0-9._-]/_/:session_name}:#{window_index}.#{pane_index}|d=#{s/${SAFE}/_/:#{=32:#{${O}detail}}}~,}#{?#{m:${AGENTMUX_MAGIC}|*,#{pane_title}},#{?${VIS},#{s/^${AGENTMUX_MAGIC}[|][^~]*~//:pane_title},#{s/[|]x=1[|]/|x=0|/:#{s/^${AGENTMUX_MAGIC}[|][^~]*~//:pane_title}}},}}"
+ENTRY="#{?${SG},,#{?#{${O}state},h=${HOSTF}|s=${LS}|k=#{${O}kind}|p=#{s/${SAFE}/_/:${O}project}|b=#{${O}start}|n=#{${O}subagents}|u=#{${O}updated}|x=${VIS}|w=#{s/[^A-Za-z0-9._-]/_/:session_name}:#{window_index}.#{pane_index}|d=#{s/${SAFE}/_/:#{=32:#{${O}detail}}}~,}#{?${RVALID},#{?${VIS},#{s/^${AGENTMUX_MAGIC}[|][^~]*~//:pane_title},#{s/[|]x=1[|]/|x=0|/:#{s/^${AGENTMUX_MAGIC}[|][^~]*~//:pane_title}}},}}"
 setg "${O}title_enc" "${AGENTMUX_MAGIC}|h=${HOSTF}|t=#{e|/|:%s,60}|hb=60~#{S:#{W:#{P:${ENTRY}}}}"
 setg "${O}allstates" "#{S:#{W:#{E:${O}wstates}}}"
 setg "${O}title_human" "#{session_name}:#{window_name}#{?#{m:*blocked*,#{E:${O}allstates}}, - agent blocked,#{?#{m:*done*,#{E:${O}allstates}}, - agent done,}}"
@@ -155,7 +158,7 @@ setg "${O}layout" "#{?${FOLLOW_COND},${JOIN},#{?${LONELY_COND},kill-pane -t ${SB
 setg "${O}ensure_or_layout" "#{?#{&&:#{${O}on},#{!:#{m:?*,${SB}}}},${ENSURE},#{E:${O}layout}}"
 # Seen: a done pane you are looking at becomes idle; a viewed ssh pane marks its remote
 # done-set as seen. Always ends with the redraw signal so the sidebar repaints.
-setg "${O}seen" "#{P:#{?#{&&:#{==:#{${O}state},done},#{&&:#{window_active},#{session_attached}}},set -p -t #{pane_id} ${O}state idle ; ,}#{?#{&&:#{${O}r_host},#{&&:#{!:#{${O}r_seen}},#{&&:#{window_active},#{session_attached}}}},set -p -t #{pane_id} ${O}r_seen 1 ; ,}}wait-for -S ${AGENTMUX_REDRAW_CHANNEL}"
+setg "${O}seen" "#{P:#{?#{&&:#{==:#{${O}state},done},#{&&:#{window_active},#{session_attached}}},set -p -t #{pane_id} ${O}state idle ; ,}#{?#{&&:${RVALID},#{&&:#{!:#{${O}r_seen}},#{&&:#{window_active},#{session_attached}}}},set -p -t #{pane_id} ${O}r_seen 1 ; ,}}wait-for -S ${AGENTMUX_REDRAW_CHANNEL}"
 
 # ------------------------------------------------------------- hooks (indices 70-79) ----
 hook() { tmux set-hook -g "$1" "$2"; }

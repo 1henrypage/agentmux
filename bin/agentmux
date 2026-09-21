@@ -100,19 +100,24 @@ ensure_codex_feature() {
   file=$CODEX_CONFIG
   [ -e "$file" ] || { mkdir -p "$(dirname "$file")"; : >"$file"; }
   if awk '
+    BEGIN { key = "^[[:space:]]*(hooks|\"hooks\"|\047hooks\047)[[:space:]]*=[[:space:]]*" }
     /^[[:space:]]*\[/ { sect = ($0 ~ /^[[:space:]]*\[features\][[:space:]]*(#.*)?$/) }
-    sect && /^[[:space:]]*hooks[[:space:]]*=[[:space:]]*true/ { found = 1 }
+    sect && $0 ~ (key "true[[:space:]]*(#.*)?$") { found = 1 }
     END { exit found ? 0 : 1 }' "$file"; then
     return 0
   fi
   tmp=$(mktemp "${TMPDIR:-/tmp}/agentmux.XXXXXX") || die mktemp
   awk '
+    BEGIN { key = "^[[:space:]]*(hooks|\"hooks\"|\047hooks\047)[[:space:]]*=[[:space:]]*" }
     /^[[:space:]]*\[/ {
       if (sect && !done) { print "hooks = true"; done = 1 }
       sect = ($0 ~ /^[[:space:]]*\[features\][[:space:]]*(#.*)?$/)
       seen = seen || sect
     }
-    sect && /^[[:space:]]*hooks[[:space:]]*=[[:space:]]*false/ { sub(/false/, "true"); done = 1 }
+    sect && $0 ~ key {
+      if ($0 ~ (key "false[[:space:]]*(#.*)?$")) sub(/false/, "true")
+      done = 1
+    }
     { print }
     END {
       if (!seen) { if (NR > 0) print ""; print "[features]"; print "hooks = true" }

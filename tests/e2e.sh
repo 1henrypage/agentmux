@@ -69,6 +69,15 @@ assert_eq "PostToolUse (other id, subagent) keeps blocked" blocked "$(opt "$P" s
 fire claude PostToolUse-match "$SP" "$PID" "$P" PostToolUse
 assert_eq "PostToolUse (matching id) -> delegating" delegating "$(opt "$P" state)"
 
+# Completion hooks must run for tools that used to be excluded by Claude's matcher.
+fire claude PermissionRequest-Read "$SP" "$PID" "$P"
+assert_eq "Read PermissionRequest -> blocked" blocked "$(opt "$P" state)"
+fire claude PostToolUse-Read-match "$SP" "$PID" "$P" PostToolUse
+assert_eq "Read PostToolUse clears matching block" delegating "$(opt "$P" state)"
+fire claude PermissionRequest-Read "$SP" "$PID" "$P"
+fire claude PostToolUseFailure-Read-match "$SP" "$PID" "$P" PostToolUseFailure
+assert_eq "Read PostToolUseFailure clears matching block" delegating "$(opt "$P" state)"
+
 fire claude PreToolUse-AskUserQuestion "$SP" "$PID" "$P"
 assert_eq "AskUserQuestion -> blocked" blocked "$(opt "$P" state)"
 assert_eq "question detail" question "$(opt "$P" detail)"
@@ -213,6 +222,51 @@ assert_eq "viewed window Stop -> idle directly" idle "$(optin "$IP" state)"
 tin select-window -t main:2
 poll_eq "viewing the done window flips it idle" idle tin show -pqv -t "$IP2" @agentmux_state
 tin select-window -t main:1
+
+# An expired cache is invalid everywhere, not merely downgraded to an idle badge.
+# Stop accepting fresh heartbeats first so the synthetic expiry cannot race title-changed.
+t set-hook -gu 'pane-title-changed[70]'
+sleep 0.2
+t set -pu -t "$OUTER" @agentmux_r_seen \; set -p -t "$OUTER" @agentmux_r_exp 1
+assert_empty "expired remote has no effective state" "$(t display -p -t "$OUTER" '#{E:@agentmux_pstate}')"
+assert_empty "expired remote has no effective host" "$(t display -p -t "$OUTER" '#{E:@agentmux_phost}')"
+assert_not_contains "expired remote label omits host" "$RHOST/" "$(t display -p -t "$OUTER" '#{E:@agentmux_label}')"
+assert_empty "expired remote has no timer" "$(t display -p -t "$OUTER" '#{E:@agentmux_timer}')"
+EXPIRED_TITLE=$(t display -p '#{E:@agentmux_title_enc}')
+assert_not_contains "expired remote is not re-embedded" '|w=main:1.1|' "$EXPIRED_TITLE"
+
+# A local writer taking over a formerly remote pane clears the entire decoded cache in the
+# same transaction; the unchanged AGX1 title must not win over the new local state.
+FORMER=$(t new-window -d -P -F '#{pane_id}' -t lap: 'sleep 1000')
+OLD_TITLE='AGX1|h=oldhost|t=1|hb=0~h=oldhost|s=blocked|k=claude|p=oldproj|b=1|n=0|u=1|x=0|w=old:1.1|d=old~'
+t select-pane -T "$OLD_TITLE" -t "$FORMER" \; \
+  set -p -t "$FORMER" @agentmux_r_host oldhost \; \
+  set -p -t "$FORMER" @agentmux_r_n 1 \; \
+  set -p -t "$FORMER" @agentmux_r_worst blocked \; \
+  set -p -t "$FORMER" @agentmux_r_worst2 blocked \; \
+  set -p -t "$FORMER" @agentmux_r_deleg 0 \; \
+  set -p -t "$FORMER" @agentmux_r_proj oldproj \; \
+  set -p -t "$FORMER" @agentmux_r_kind claude \; \
+  set -p -t "$FORMER" @agentmux_r_start 1 \; \
+  set -p -t "$FORMER" @agentmux_r_exp 0 \; \
+  set -p -t "$FORMER" @agentmux_r_seen 1 \; \
+  set -p -t "$FORMER" @agentmux_r_done oldhost:old:1.1 \; \
+  set -p -t "$FORMER" @agentmux_r_prev "$OLD_TITLE" \; \
+  set -p -t "$FORMER" @agentmux_r_notified old
+fire claude SessionStart "$SP" "$PID" "$FORMER"
+fire claude UserPromptSubmit "$SP" "$PID" "$FORMER"
+remote_left=""
+for name in r_host r_n r_worst r_worst2 r_deleg r_proj r_kind r_start r_exp r_seen r_done r_prev r_notified; do
+  value=$(opt "$FORMER" "$name")
+  [ -z "$value" ] || remote_left="$remote_left $name=$value"
+done
+assert_empty "local write clears every remote cache option" "$remote_left"
+assert_eq "formerly remote pane shows local state" working "$(t display -p -t "$FORMER" '#{E:@agentmux_pstate}')"
+assert_eq "formerly remote pane shows local project" src "$(t display -p -t "$FORMER" '#{E:@agentmux_pproj}')"
+FORMER_LABEL=$(t display -p -t "$FORMER" '#{E:@agentmux_label}')
+assert_contains "formerly remote label shows local project" src "$FORMER_LABEL"
+assert_not_contains "formerly remote label omits old host" oldhost "$FORMER_LABEL"
+t kill-window -t "$FORMER"
 
 # ------------------------------------------------------------------ 4. omnigent hop ----
 section "omnigent hop (private -S server)"

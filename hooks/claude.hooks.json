@@ -38,13 +38,11 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^(?!(Read|Grep|Glob|LS|TodoWrite|ToolSearch|BashOutput|Monitor|TaskCreate|TaskUpdate|TaskList|TaskGet|Skill)$).*",
         "hooks": [{ "type": "command", "command": "__HOOK__ claude PostToolUse", "timeout": 5 }]
       }
     ],
     "PostToolUseFailure": [
       {
-        "matcher": "^(?!(Read|Grep|Glob|LS|TodoWrite|ToolSearch|BashOutput|Monitor|TaskCreate|TaskUpdate|TaskList|TaskGet|Skill)$).*",
         "hooks": [{ "type": "command", "command": "__HOOK__ claude PostToolUseFailure", "timeout": 5 }]
       }
     ]

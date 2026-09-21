@@ -509,6 +509,12 @@ main() {
   case $mode in
   direct | hop)
     set --
+    # A direct/hopped agent makes this pane local again. Invalidate the complete decoded
+    # remote summary atomically with the local write so no renderer can prefer stale SSH
+    # state, even if the pane title has not changed yet.
+    for o in r_host r_n r_worst r_worst2 r_deleg r_proj r_kind r_start r_exp r_seen r_done r_prev r_notified; do
+      set -- "$@" set -pu -t "$pane" "$AGX_OPT$o" \;
+    done
     if [ "$event" = SessionEnd ]; then
       for o in state kind project start subagents detail sid updated host; do
         set -- "$@" set -pu -t "$pane" "$AGX_OPT$o" \;
