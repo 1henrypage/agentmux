@@ -1,88 +1,159 @@
 # agentmux
 
-Agent overview and state tracking for tmux. Every Claude Code and Codex session you run,
-local, inside omnigent, or over ssh, shows up as a badge on its window tab and as a row in a
-sidebar, with `working`, `delegating` (sub-agents still running), `blocked` (needs you),
-`done` and `idle` states, an elapsed timer, and desktop notifications when an agent you are
-not looking at needs input or finishes.
+A tmux plugin that shows what every Claude Code and Codex agent is doing, on the window tab
+and in a sidebar.
 
-No polling. Agents report through their own hook systems into tmux pane options; tmux
-formats render them with zero forks; ssh hops are bridged through the terminal title.
+<!-- TODO(henry): screenshot of the sidebar next to a status line with agents in a few
+different states, saved as docs/sidebar.png, then:
+![agentmux sidebar](docs/sidebar.png)
+-->
+
+I kept losing track of which agent was waiting on me. With several running across tmux
+windows and an ssh host or two, the one you are not looking at is always the one stuck on
+a permission prompt. The overview that fixes this comes from
+[herdr](https://github.com/herdrdev/herdr). herdr is a multiplexer of its own though, and
+I wanted to stay in tmux, so agentmux does the same thing as a plugin: a badge on every
+tab, a sidebar listing every agent, and a desktop notification when an agent you are not
+watching needs you or finishes.
+
+## States
+
+An agent is always in one of five states. When a window holds more than one agent, the tab
+shows the worst of them, in this order.
+
+| state | badge | meaning |
+|---|---|---|
+| `blocked` | `󰸇` | waiting on you: a permission prompt, a question, a plan review |
+| `done` | `󰄬` | the turn finished while you were looking elsewhere; clears once you view the window |
+| `delegating` | `󰀐N` | the main turn ended but N sub-agents are still running |
+| `working` | `●` | a turn is in progress |
+| `idle` | `·` | nothing running |
 
 ## Install
+
+With TPM, the tmux plugin manager:
 
 ```tmux
 # ~/.tmux.conf
 set -g @plugin '1henrypage/agentmux'
-set -g @agentmux_width 46          # sidebar columns (default 46)
-set -g @agentmux_key a             # prefix + a toggles the sidebar (`off` to skip)
 set -g window-status-format "#{E:@agentmux_badge} #I #{E:@agentmux_label}#{E:@agentmux_timer}"
 set -g window-status-current-format "#[bold]#{E:@agentmux_badge} #I #{E:@agentmux_label}#{E:@agentmux_timer}#[nobold]"
 run '~/.tmux/plugins/tpm/tpm'
 ```
 
-Then `prefix I` to fetch the plugin and register the hooks once:
+The two `window-status` lines are what put the badge, label and timer on the tab. If you
+already have your own format, drop the three `#{E:@agentmux_*}` fragments into it wherever
+you like.
+
+Press `prefix I` to fetch the plugin, then run the installer once from wherever TPM put it
+(`~/.tmux/plugins` or `~/.local/share/tmux/plugins`):
 
 ```sh
-~/.local/share/tmux/plugins/agentmux/bin/agentmux install-hooks
+~/.tmux/plugins/agentmux/bin/agentmux install-hooks
 ```
 
-This merges tagged entries into `~/.claude/settings.json` and `~/.codex/hooks.json`
-(`$CLAUDE_CONFIG_DIR` / `$CODEX_HOME` respected), turns on `[features] hooks = true` in
-Codex's `config.toml`, and leaves everything else in those files untouched. It is
-idempotent. Restart running agents afterwards (hooks are read at session start); Codex needs
-one `/hooks` in its TUI to trust the new entries. `uninstall-hooks` removes exactly what
-`install-hooks` added; `status` shows what is registered and what tmux currently sees.
+The installer merges its entries into `~/.claude/settings.json` and `~/.codex/hooks.json`,
+sets `hooks = true` under `[features]` in Codex's `config.toml`, and leaves everything else
+in those files as it found it. It respects `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, backs each
+file up once as `<file>.agentmux.bak`, and running it a second time changes nothing.
+`uninstall-hooks` removes exactly the entries it added. `status` prints what is registered
+and what tmux currently sees.
 
-Requirements: tmux >= 3.4, POSIX sh, python3 >= 3.9 (sidebar and title decoding), jq or
-python3 for the installer, a Nerd Font for the glyphs.
+Agents read their hooks at startup, so restart any that were already running. Codex also
+needs one `/hooks` in its TUI to trust the new entries.
 
-## What you get
+You need tmux 3.4 or newer, a POSIX sh, Python 3.9 or newer for the sidebar and for
+decoding remote titles, and a Nerd Font for the glyphs. The installer uses jq when it is
+present and Python otherwise.
 
-- **Tab badge** per window: `·` idle, `●` working, `󰀐N` delegating with the sub-agent
-  count, `󰸇` blocked, `󰄬` done. Worst state wins across panes. Label `project:agent` and a
-  ticking `3m05s` timer while a turn runs. Remote agents read `󰐠 host/project:agent`.
-- **Sidebar** (`prefix a`): a 46-column pane on the left that follows your current window,
-  cannot take focus, and lists every agent on the server grouped by host, worst first, with a
-  detail line (the prompt, the tool it is waiting on, `finished 3m ago`).
-- **Remote**: a tmux running agentmux on a box you ssh into packs its agents into the
-  terminal title; your laptop decodes it. Works through nested hops (bastion, `dbexec`) and
-  without a remote tmux (the hook writes the title itself over ssh).
-- **omnigent**: agents launched inside omnigent's private tmux are attributed to the outer
-  pane that displays them.
-- **Notifications**: macOS (`terminal-notifier` or `osascript`) and Linux (`notify-send`),
-  only for windows you are not looking at, never with sound.
+## Usage
+
+### Tabs
+
+Each tab shows the badge, the label `project:agent` and, while a turn runs, a timer such as
+`3m05s`. The project is the name of the nearest git checkout above the agent's working
+directory, the agent is `claude` or `codex`. With several agent panes in one window the
+badge is the worst state among them and the label follows the active pane. A remote agent
+carries its host in the label: `󰐠 devbox/api-server:claude`.
+
+### Sidebar
+
+`prefix a` opens a pane down the left of the current window, 46 columns wide, and closes it
+again. It follows you from window to window, lists every agent on the tmux server grouped
+by host with the worst state first, and cannot take focus. Each agent gets a detail line:
+the prompt it is working on, the tool it is waiting for permission on, or `finished 3m ago`.
+`@agentmux_sidebar_density compact` drops the detail line and fits twice as many agents.
+
+### Notifications
+
+An agent in a window you are not looking at sends a desktop notification when it becomes
+`blocked` or `done`, through `terminal-notifier` or `osascript` on macOS and `notify-send`
+on Linux. Windows you are looking at never notify, and nothing ever makes a sound.
+
+### Remote agents
+
+Install agentmux in the tmux on a host you ssh into and its agents appear in your local
+tabs and sidebar as well. The remote tmux encodes its agent states into the terminal title
+and the local tmux decodes them from the pane that runs ssh. This works through nested hops
+such as a bastion, and it works without a remote tmux at all, because the hook writes the
+title itself when it notices an ssh connection.
+
+### omnigent
+
+Agents started inside omnigent's private tmux server show up on the outer pane that
+displays them.
 
 ## Options
 
+Set these in `~/.tmux.conf` before the `run` line for TPM.
+
 | option | default | meaning |
 |---|---|---|
-| `@agentmux_width` | 46 | sidebar width |
-| `@agentmux_key` | `a` | toggle key under prefix, `off` disables |
-| `@agentmux_titles` | `auto` | `auto` emits AGX1 to tmux clients and a human title otherwise, `human` never encodes, `off` leaves `set-titles` alone |
-| `@agentmux_notify` / `@agentmux_notify_done` | `on` | notifications on blocked / done |
-| `@agentmux_ttl` | 14400 | seconds after which a stale state renders idle |
-| `@agentmux_sidebar_density` | `full` | `compact` = one line per agent |
-| `@agentmux_hostname` | `#{host_short}` | host name override |
-| `@agentmux_color_*` | terminal colours | `blocked done delegating working idle project agent remote text fg dim sidebar_bg` |
+| `@agentmux_width` | `46` | sidebar width in columns |
+| `@agentmux_key` | `a` | toggle key under prefix, `off` for none |
+| `@agentmux_titles` | `auto` | `auto` encodes state into the title for tmux clients and writes a readable title for anything else, `human` never encodes, `off` leaves `set-titles` alone |
+| `@agentmux_notify` | `on` | notify on `blocked` |
+| `@agentmux_notify_done` | `on` | notify on `done` |
+| `@agentmux_ttl` | `14400` | seconds after which a stale state renders as `idle` |
+| `@agentmux_sidebar_density` | `full` | `compact` for one line per agent |
+| `@agentmux_hostname` | `#{host_short}` | host name shown for local agents |
+| `@agentmux_color_<name>` | terminal colours | `blocked`, `done`, `delegating`, `working`, `idle`, `project`, `agent`, `remote`, `text`, `fg`, `dim`, `sidebar_bg` |
 
-tmux-resurrect users: add `set -g @resurrect-processes '~agentmux-sidebar'` so the sidebar
-survives a restore.
+If you use tmux-resurrect, add `set -g @resurrect-processes '~agentmux-sidebar'` so the
+sidebar comes back after a restore.
 
 ## How it works
 
-See [docs/CONTRACT.md](docs/CONTRACT.md) for the option contract, the AGX1 title grammar,
-the hook state machine and the display-pane resolution (direct / omnigent hop / bare ssh).
+Claude Code and Codex both have hook systems, and the installer registers one small POSIX
+sh script as the hook for the events that matter: session start and end, prompt submitted,
+permission request, tool use, stop, sub-agent start and stop. On each event the hook works
+out the new state and writes it into options on the tmux pane the agent runs in. The
+badge, label and timer are tmux formats over those options, so drawing the status line
+never forks a process, and nothing polls. The sidebar is a Python renderer that repaints
+when the hook signals it. Over ssh the same state rides in the terminal title, and the
+local tmux decodes it whenever the title of an ssh pane changes.
 
-Known warts: after the focus bounce off the sidebar, `prefix ;` is a no-op once; `prefix o`
-from the last pane does not wrap onto the sidebar (by design, it is not focusable). One
-sidebar per server, in the current window of the most recently active client.
+The option contract, the title grammar and the hook state machine are in
+[docs/CONTRACT.md](docs/CONTRACT.md).
+
+## Known warts
+
+- After the focus bounce off the sidebar, `prefix ;` is a no-op once.
+- `prefix o` from the last pane does not wrap onto the sidebar. That is by design, the
+  sidebar is not focusable.
+- One sidebar per tmux server, in the current window of the client that was active most
+  recently.
 
 ## Development
 
 ```sh
-make check     # shellcheck + ruff + unit tests + installer tests + e2e on scratch tmux servers
-make e2e       # only the tmux end-to-end suite
+make check   # shellcheck, ruff, unit tests, installer tests, end-to-end on scratch tmux servers
+make e2e     # the tmux end-to-end suite alone
 ```
 
-All tests are hermetic (private sockets, temp `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`).
+Every test is hermetic: a private tmux socket and a temporary `HOME`, `CLAUDE_CONFIG_DIR`
+and `CODEX_HOME`, so nothing touches your real config.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE).
