@@ -7,6 +7,7 @@
 #   4. Omnigent hop: private -S server attached from an outer pane, state lands on the outer
 #      pane; a private server with no client gets markers only.
 #   5. Sidebar: toggle, follow, bounce, fix, lonely, skip, toggle off.
+#   6. Sidebar give-back: every way out of a window hands each pane back what it lent.
 # shellcheck disable=SC2154,SC1010,SC2015
 set -u
 # shellcheck source=lib.sh
@@ -338,6 +339,207 @@ tin set -gu @agentmux_sidebar_skip
 tin run-shell "$ROOT/bin/agentmux toggle '$CLIENT'"
 poll_empty "toggle removes the sidebar" tin display -p '#{E:@agentmux_sb_pane}'
 assert_eq "sidebar off" 0 "$(tin show -gqv @agentmux_on)"
+
+# ------------------------------------------------------------ 6. give-back ----
+# The sidebar borrows columns from a window's panes and must give each pane back exactly what
+# it lent, however it leaves (docs/CONTRACT.md, "Sidebar placement"). @agentmux_on is 0 here
+# (just toggled off above), so every toggle below is a clean open/close cycle. Toggle is
+# synchronous, give-back included, so what it leaves behind is asserted without polling.
+section "sidebar give-back (borrow/restore contract)"
+
+# mkgbwin [CMD] -> $GBW (window id), $GBP1/$GBP2 (an unequal two-pane split, CMD running in
+# the first pane), $GBCLEAN (its layout)
+mkgbwin() {
+  GBW=$(tin new-window -d -P -F '#{window_id}' -t main: "${1:-sleep 1000}")
+  GBP1=$(tin display -p -t "$GBW" '#{pane_id}')
+  GBP2=$(tin split-window -h -d -P -F '#{pane_id}' -t "$GBP1" -l 60 'sleep 1000')
+  GBCLEAN=$(tin display -p -t "$GBW" '#{window_layout}')
+}
+gbtoggle() { tin run-shell "$ROOT/bin/agentmux toggle '$CLIENT'"; }
+gblayout() { tin display -p -t "$1" '#{window_layout}'; }
+gbwidth() { tin display -p -t "$1" '#{pane_width}'; }
+gbsb() { tin display -p '#{E:@agentmux_sb_pane}'; }
+
+# 1. The reported bug: touch nothing while the sidebar is open, and any number of toggles
+# leaves the window exactly as it was.
+mkgbwin
+tin select-window -t "$GBW"
+gbtoggle
+assert_nonempty "give-back 1: toggle on" "$(gbsb)"
+assert_ne "give-back 1: the sidebar squeezes the window's panes" "$GBCLEAN" "$(gblayout "$GBW")"
+gbtoggle
+assert_eq "give-back 1: the reported bug - toggling off restores the layout exactly" "$GBCLEAN" "$(gblayout "$GBW")"
+cyc=1
+while [ "$cyc" -le 5 ]; do
+  gbtoggle
+  gbtoggle
+  cyc=$((cyc + 1))
+done
+assert_empty "give-back 1: 5 back-to-back cycles end with the sidebar gone" "$(gbsb)"
+# The renderer turns the sidebar on as it starts (for tmux-resurrect), which here lands
+# while toggle is still closing it: toggle must turn it off atomically with the kill.
+assert_eq "give-back 1: and turned off" 0 "$(tin show -gqv @agentmux_on)"
+assert_eq "give-back 1: 5 back-to-back cycles leave the layout identical" "$GBCLEAN" "$(gblayout "$GBW")"
+assert_empty "give-back 1: and no history behind" "$(tin show -w -t "$GBW" | grep '@agentmux_w')"
+tin kill-window -t "$GBW"
+# Toggling off resizes each pane's program once, straight to its final width: no frame shows
+# the sidebar's columns lumped into its neighbour first. The first pane logs every SIGWINCH.
+cat >"$WORK/winch.py" <<'EOF'
+import os, signal, sys, time
+def log(*_):
+    with open(sys.argv[1], "a") as fh:
+        fh.write(f"{os.get_terminal_size().columns}\n")
+signal.signal(signal.SIGWINCH, log)
+while True:
+    time.sleep(1)
+EOF
+mkgbwin "python3 $WORK/winch.py $WORK/winch.log"
+tin select-window -t "$GBW"
+gbtoggle
+sleep 0.6 # past the open's own resize, and the 250 ms tmux holds a follow-up resize back
+: >"$WORK/winch.log"
+gbtoggle
+sleep 0.6
+assert_eq "give-back 1: toggling off resizes a pane once, straight to its width" "$(gbwidth "$GBP1")" "$(cat "$WORK/winch.log")"
+assert_eq "give-back 1: and that width is the one it had" "$GBCLEAN" "$(gblayout "$GBW")"
+tin kill-window -t "$GBW"
+
+# 2. Follow-away: a window the sidebar merely passes through gets its layout back too, even
+# when the owner switches back and forth faster than a give-back takes.
+mkgbwin
+GBA=$GBW GBA_CLEAN=$GBCLEAN
+mkgbwin
+GBB=$GBW GBB_CLEAN=$GBCLEAN
+tin select-window -t "$GBA"
+gbtoggle
+assert_eq "give-back 2: sidebar on in window A" "$GBA" "$(tin display -p '#{E:@agentmux_sb_win}')"
+tin select-window -t "$GBB"
+poll_eq "give-back 2: the sidebar follows to window B" "$GBB" tin display -p '#{E:@agentmux_sb_win}'
+poll_eq "give-back 2: window A is restored once the sidebar leaves it" "$GBA_CLEAN" gblayout "$GBA"
+assert_ne "give-back 2: window B is squeezed" "$GBB_CLEAN" "$(gblayout "$GBB")"
+cyc=1
+while [ "$cyc" -le 4 ]; do
+  tin select-window -t "$GBA"
+  tin select-window -t "$GBB"
+  cyc=$((cyc + 1))
+done
+poll_eq "give-back 2: after a burst of switches the sidebar settles in window B" "$GBB" tin display -p '#{E:@agentmux_sb_win}'
+poll_eq "give-back 2: window A is still exactly restored" "$GBA_CLEAN" gblayout "$GBA"
+gbtoggle
+assert_eq "give-back 2: window B is exactly restored by toggle off" "$GBB_CLEAN" "$(gblayout "$GBB")"
+tin kill-window -t "$GBA"
+tin kill-window -t "$GBB"
+
+# 3. Resize while open: the resize is kept, and each pane gets what it lent on top of it.
+mkgbwin
+tin select-window -t "$GBW"
+GBLENT1=$(gbwidth "$GBP1") GBLENT2=$(gbwidth "$GBP2")
+gbtoggle
+GBLENT1=$((GBLENT1 - $(gbwidth "$GBP1"))) GBLENT2=$((GBLENT2 - $(gbwidth "$GBP2")))
+tin resize-pane -t "$GBP1" -x 20
+GBDRAG1=$(gbwidth "$GBP1") GBDRAG2=$(gbwidth "$GBP2")
+gbtoggle
+assert_eq "give-back 3: the resized pane gets what it lent on top of the resize" "$((GBDRAG1 + GBLENT1))" "$(gbwidth "$GBP1")"
+assert_eq "give-back 3: so does the pane the resize grew" "$((GBDRAG2 + GBLENT2))" "$(gbwidth "$GBP2")"
+tin kill-window -t "$GBW"
+
+# 4. Pane added while open: no per-pane give-back any more, so the panes scale up to fill the
+# window, each growing.
+mkgbwin
+tin select-window -t "$GBW"
+gbtoggle
+GBP3=$(tin split-window -h -d -P -F '#{pane_id}' -t "$GBP1" 'sleep 1000')
+GBOPEN1=$(gbwidth "$GBP1") GBOPEN2=$(gbwidth "$GBP2") GBOPEN3=$(gbwidth "$GBP3")
+gbtoggle
+GBFIN1=$(gbwidth "$GBP1") GBFIN2=$(gbwidth "$GBP2") GBFIN3=$(gbwidth "$GBP3")
+assert_eq "give-back 4: the added-pane fallback fills the window" "$(tin display -p -t "$GBW" '#{window_width}')" "$((GBFIN1 + 1 + GBFIN2 + 1 + GBFIN3))"
+if [ "$GBFIN1" -gt "$GBOPEN1" ] && [ "$GBFIN2" -gt "$GBOPEN2" ] && [ "$GBFIN3" -gt "$GBOPEN3" ]; then ok
+else ko "give-back 4: every pane grows ($GBOPEN1|$GBOPEN2|$GBOPEN3 -> $GBFIN1|$GBFIN2|$GBFIN3)"
+fi
+tin kill-window -t "$GBW"
+
+# 5. Zoom. Removing any pane unzooms its window (tmux does that before any hook runs), so
+# closing the sidebar under a zoom must still give the layout back.
+mkgbwin
+tin select-window -t "$GBW"
+gbtoggle
+tin resize-pane -Z -t "$GBP1"
+assert_eq "give-back 5: window zoomed before close" 1 "$(tin display -p -t "$GBW" '#{window_zoomed_flag}')"
+assert_empty "give-back 5: closing it under a zoom reports no error" "$(gbtoggle 2>&1)"
+assert_eq "give-back 5: layout restored despite the zoom" "$GBCLEAN" "$(gblayout "$GBW")"
+# A give-back that lands on a window zoomed since (it can race the user) keeps the zoom:
+# select-layout alone would pop it. Arm one by hand on a zoomed window.
+tin resize-pane -t "$GBP1" -x 30
+GBSQ=$(gblayout "$GBW")
+tin resize-pane -Z -t "$GBP1"
+tin set -w -t "$GBW" @agentmux_wclean "$GBCLEAN" \; set -w -t "$GBW" @agentmux_wsq0 "$GBSQ" \; \
+  set -w -t "$GBW" @agentmux_wsq "$GBSQ"
+tin run-shell "$ROOT/bin/agentmux relayout '$GBW'"
+assert_eq "give-back 5: a zoomed window is given back" "$GBCLEAN" "$(gblayout "$GBW")"
+assert_eq "give-back 5: and stays zoomed" 1 "$(tin display -p -t "$GBW" '#{window_zoomed_flag}')"
+assert_empty "give-back 5: and its history is cleared" "$(tin show -wqv -t "$GBW" @agentmux_wsq)"
+tin kill-window -t "$GBW"
+
+# 6. Evicted by @agentmux_sidebar_skip: that runs inside a hook, which tmux hides from every
+# other hook, yet the window gets its layout back.
+mkgbwin
+tin select-window -t "$GBW"
+gbtoggle
+tin set -g @agentmux_sidebar_skip '#{m:SKIPME*,#{pane_title}}'
+tin select-pane -T SKIPME -t "$GBP1"
+poll_empty "give-back 6: the skip evicts the sidebar" gbsb
+poll_eq "give-back 6: the evicted window is restored" "$GBCLEAN" gblayout "$GBW"
+tin select-pane -T plain -t "$GBP1"
+poll_nonempty "give-back 6: the sidebar comes back" gbsb
+gbtoggle
+assert_eq "give-back 6: and toggling it off restores the window again" "$GBCLEAN" "$(gblayout "$GBW")"
+tin set -gu @agentmux_sidebar_skip
+tin kill-window -t "$GBW"
+
+# 7. Killed by hand (or its renderer died): @agentmux_track gives the window back from the
+# layout it last saw, including a fix made inside a hook, which it cannot see. Here the user
+# re-lays the window out, the fix puts the sidebar back at its width, then the user kills it.
+mkgbwin
+tin select-window -t "$GBW"
+GBLENT1=$(gbwidth "$GBP1") GBLENT2=$(gbwidth "$GBP2")
+gbtoggle
+GBSB=$(gbsb)
+GBLENT1=$((GBLENT1 - $(gbwidth "$GBP1"))) GBLENT2=$((GBLENT2 - $(gbwidth "$GBP2")))
+tin select-layout -t "$GBW" even-horizontal
+poll_eq "give-back 7: the fix puts the sidebar back to its width" 46 gbwidth "$GBSB"
+GBEVEN1=$(gbwidth "$GBP1") GBEVEN2=$(gbwidth "$GBP2")
+tin set -g @agentmux_on 0 \; kill-pane -t "$GBSB"
+poll_eq "give-back 7: a sidebar killed by hand gives pane 1 what it lent" "$((GBEVEN1 + GBLENT1))" gbwidth "$GBP1"
+assert_eq "give-back 7: and pane 2" "$((GBEVEN2 + GBLENT2))" "$(gbwidth "$GBP2")"
+tin kill-window -t "$GBW"
+# The same for a fix no layout event follows: a new @agentmux_width, applied on the next
+# title change. The kill must give back from the layout that fix left, not the one before.
+mkgbwin
+tin select-window -t "$GBW"
+gbtoggle
+GBSB=$(gbsb)
+GBSQ0=$(tin show -wqv -t "$GBW" @agentmux_wsq0)
+tin set -g @agentmux_width 40
+tin select-pane -T retitled -t "$GBP1"
+poll_eq "give-back 7: a new width is applied on the next hook" 40 gbwidth "$GBSB"
+GBEXPECT=$(python3 "$ROOT/agentmux/relayout.py" "$GBCLEAN" "$GBSQ0" "$(gblayout "$GBW")" "$GBP1,$GBP2")
+tin set -g @agentmux_on 0 \; kill-pane -t "$GBSB"
+poll_eq "give-back 7: the kill gives back from the layout the fix left" "$GBEXPECT" gblayout "$GBW"
+tin set -g @agentmux_width 46
+tin kill-window -t "$GBW"
+
+# 8. A reload clears history left on windows the sidebar is not in, one window or several.
+mkgbwin
+GBA=$GBW
+mkgbwin
+tin set -w -t "$GBA" @agentmux_wsq stale \; set -w -t "$GBW" @agentmux_wsq stale \; \
+  set -w -t "$GBW" @agentmux_wclean stale
+assert_empty "give-back 8: a reload reports no error" "$(tin run-shell "$ROOT/agentmux.tmux" 2>&1)"
+assert_empty "give-back 8: and clears every window's history" \
+  "$(tin show -w -t "$GBA" | grep '@agentmux_w')$(tin show -w -t "$GBW" | grep '@agentmux_w')"
+tin kill-window -t "$GBA"
+tin kill-window -t "$GBW"
+
 LOGF=$XDG_STATE_HOME/agentmux/sidebar.log
 if [ -s "$LOGF" ]; then ko "sidebar.log not empty: $(head -3 "$LOGF")"; else ok; fi
 

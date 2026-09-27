@@ -47,6 +47,40 @@ default, see [Sidebar placement](#sidebar-placement)), and the eleven colours
 Runtime: `@agentmux_on` (sidebar wanted), `@agentmux_owner` (client whose current window
 the sidebar follows).
 
+## Window options
+
+The first window-scoped (`set -w`) options in the plugin. They record a window's
+borrow/give-back history so a departing sidebar can hand back exactly the columns it
+took from that window's other panes; see [Sidebar placement](#sidebar-placement). A window
+has them only while it holds the sidebar, or for the moment between the sidebar leaving it
+and its give-back.
+
+| option | values | notes |
+|---|---|---|
+| `@agentmux_wclean` | `#{window_layout}` | layout right **before** the sidebar arrived |
+| `@agentmux_wsq0` | `#{window_layout}` | layout right **after** the sidebar arrived; `wclean` vs `wsq0` is what each cell lent |
+| `@agentmux_wsq` | `#{window_layout}` | layout as of the **latest** change while the sidebar is in the window; still set once the sidebar has left, it means the window is owed its give-back |
+
+Whatever brings the sidebar into a window (`agentmux ensure`, the follow in
+`@agentmux_layout`) sets all three. `@agentmux_track`, on `window-layout-changed`, moves
+`wsq` on after every change you make. The formats in `@agentmux_layout` move `wsq` on
+themselves, since tmux runs no hooks for commands a hook runs.
+
+Every way the sidebar leaves a window gives that window back at once, and before anything
+can bring the sidebar back to it:
+
+- Toggling off, and an eviction by `@agentmux_sidebar_skip` (`agentmux close`), kill the
+  sidebar and apply the give-back in one tmux command, so each pane is resized once,
+  straight to its final size.
+- The follow joins the sidebar into your new window straight away and gives the window it
+  left back right after (`agentmux relayout`).
+- A sidebar killed by hand, or whose renderer died, leaves `wsq` set, and `@agentmux_track`
+  gives the window back.
+
+A give-back reads and clears all three options in the same tmux command, so it happens
+once however many triggers race. A reload (`tmux source-file`, a tpm reload) clears all
+three on every window that does not hold the sidebar.
+
 ## Rendering rules (all fork-free)
 
 - A pane's state counts only while `pane_current_command` is not a shell
@@ -77,6 +111,23 @@ followed into it, and `@agentmux_on` stays `1`. The window, pane, session and
 as soon as the owner's window stops matching. agentmux knows nothing about what the format
 means; for example, a nested tmux that marks the title it sends can be kept clear of the
 sidebar with `set -g @agentmux_sidebar_skip '#{m:tmux@*,#{pane_title}}'`.
+
+The sidebar *borrows* columns from a window's other panes, and gives each pane back
+exactly the columns it borrowed from it once it leaves that window, however it leaves:
+toggled off, following you to another window, evicted by `@agentmux_sidebar_skip`, or
+killed (see [Window options](#window-options)). Concretely:
+
+- Touch nothing in a window while the sidebar is in it, and the window returns to its
+  exact previous layout - any number of toggles or visits is idempotent.
+- Resize your own panes while the sidebar is open, and your resize is kept, with the
+  borrowed columns added back on top of it. If the sidebar's own width changed meanwhile,
+  the give-back is scaled to fit the window.
+- Add or close one of your own panes while the sidebar is open, and there is nothing to
+  give back per-pane any more: the window falls back to scaling whatever panes exist now
+  up to the full window width, preserving their current ratio. Nothing is ever left
+  squeezed.
+- Closing the sidebar in a zoomed window unzooms it, as removing any pane does in tmux,
+  and the window still gets its layout back. A give-back never unzooms a window by itself.
 
 ## Scratch directory (hook side, source of truth)
 

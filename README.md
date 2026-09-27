@@ -76,9 +76,11 @@ badge is the worst state among them and the label follows the active pane.
 ### Sidebar
 
 `prefix a` opens a pane down the left of the current window, 46 columns wide, and closes it
-again. It follows you from window to window, lists every agent on the tmux server with the
-worst state first, and cannot take focus. Each agent gets a detail line: the prompt it is
-working on, the tool it is waiting for permission on, or `finished 3m ago`.
+again. The columns come out of every pane in proportion, and each pane gets its share back
+when the sidebar closes or moves on. It follows you from window to window, lists every
+agent on the tmux server with the worst state first, and cannot take focus. Each agent gets
+a detail line: the prompt it is working on, the tool it is waiting for permission on, or
+`finished 3m ago`.
 `@agentmux_sidebar_density compact` drops the detail line and fits twice as many agents.
 
 `@agentmux_sidebar_skip` keeps the sidebar out of chosen windows. It is a format evaluated

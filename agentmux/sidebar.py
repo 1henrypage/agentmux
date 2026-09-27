@@ -646,7 +646,9 @@ def main(argv: list[str] | None = None) -> int:
         socket_args = ["-S", args.socket_path]
     tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
     tmux = Tmux(tmux_bin, socket_args)
-    self_pane = os.environ.get("TMUX_PANE", "")
+    # The renderer leaves its own pane out of the list. Rows read from --input come from
+    # another server, where the id of the pane this runs in means nothing.
+    self_pane = "" if args.input else os.environ.get("TMUX_PANE", "")
 
     if args.input:
         with open(args.input, encoding="utf-8") as fh:

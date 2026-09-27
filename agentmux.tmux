@@ -128,28 +128,72 @@ setg "${O}tgt_wide" "${TGT_PRE}#{?#{m:-*,#{e|-|:#{e|-|:#{window_width},#{${O}wid
 setg "${O}tgt_skip" "${TGT_PRE}#{?#{E:${O}sidebar_skip},1,0}${TGT_POST}"
 
 SB="#{E:${O}sb_pane}"
+SBW="#{E:${O}sb_win}"
 TW="#{E:${O}tgt_win}"
 ENSURE="run-shell -b '$PLUGIN_DIR/bin/agentmux ensure'"
 JOIN="join-pane -bdfh -l #{${O}width} -s ${SB} -t ${TW}"
-FOLLOW_COND="#{&&:#{${O}on},#{&&:#{m:?*,${SB}},#{&&:#{m:?*,${TW}},#{&&:#{!=:#{E:${O}sb_win},${TW}},#{&&:#{!:#{E:${O}tgt_zoom}},#{&&:#{E:${O}tgt_wide},#{!:#{E:${O}tgt_skip}}}}}}}}"
+FOLLOW_COND="#{&&:#{${O}on},#{&&:#{m:?*,${SB}},#{&&:#{m:?*,${TW}},#{&&:#{!=:${SBW},${TW}},#{&&:#{!:#{E:${O}tgt_zoom}},#{&&:#{E:${O}tgt_wide},#{!:#{E:${O}tgt_skip}}}}}}}}"
 LONELY_COND="#{&&:#{m:?*,${SB}},#{==:#{E:${O}sb_npanes},1}}"
-SKIP_COND="#{&&:#{m:?*,${SB}},#{&&:#{==:#{E:${O}sb_win},${TW}},#{E:${O}tgt_skip}}}"
-FIX_COND="#{&&:#{m:?*,${SB}},#{&&:#{!:#{E:${O}tgt_zoom}},#{&&:#{E:${O}tgt_wide},#{&&:#{==:#{E:${O}sb_win},${TW}},#{!:#{E:${O}tgt_skip}}}}}}"
-FIX="#{?#{E:${O}sb_ok},#{?#{E:${O}sb_wok},,resize-pane -x #{${O}width} -t ${SB}},break-pane -d -s ${SB} ; ${JOIN}}"
-setg "${O}follow" "#{?${FOLLOW_COND},${JOIN},}"
+SKIP_COND="#{&&:#{m:?*,${SB}},#{&&:#{==:${SBW},${TW}},#{E:${O}tgt_skip}}}"
+FIX_COND="#{&&:#{m:?*,${SB}},#{&&:#{!:#{E:${O}tgt_zoom}},#{&&:#{E:${O}tgt_wide},#{&&:#{==:${SBW},${TW}},#{!:#{E:${O}tgt_skip}}}}}}"
 # `run-shell -C` runs the commands it generates on a later event-loop turn, so two hooks for
 # one event (e.g. after-kill-pane and window-layout-changed) can both decide to kill the same
 # sidebar, and the loser's kill-pane fails in the user's own command. A kill therefore
 # re-checks, when it runs, that the pane it names is still the sidebar: the #-escaped format
 # below survives this expansion and is evaluated by `if -F`, atomically with the kill.
 IF_STILL_SB="if -F \"##{==:##{E:${O}sb_pane#}#,${SB}#}\""
+
+# ------------------------------------------------- window layout history (give-back) ----
+# The sidebar borrows columns from every pane of a window it joins and gives each pane back
+# exactly what it lent once it leaves (docs/CONTRACT.md, "Window options"). The history:
+#   wclean  the window's layout right before the sidebar arrived
+#   wsq0    its layout right after (wclean vs wsq0 is what each cell lent)
+#   wsq     its layout as of the last change while the sidebar is in it; still set on a
+#           window the sidebar has left, it means that window is owed its give-back
+# FOOTGUN: tmux fires no hook for anything done inside a hook (notify.c drops notifications
+# raised while a hook's commands run, and `run-shell -C` runs what it generates with the
+# hook's state), so @agentmux_track never sees the sidebar move when a format below moves
+# it. Each such move does its own bookkeeping instead, and gives the window it left back
+# synchronously (`run-shell`, no -b): nothing later in the same queue, such as the next
+# window switch, can bring the sidebar back before that window is restored.
+# Every #{window_layout} below is escaped (##{..#}) so that it expands when its command runs.
+setg "${O}sb_at" "${SBQ_PRE}#{pane_id}#{window_id}${SBQ_POST}"
+# Like IF_STILL_SB, and also re-checks the window: bookkeeping for the wrong window is worse
+# than none.
+IF_SB_AT="if -F \"##{==:##{E:${O}sb_at#}#,${SB}${SBW}#}\""
+LAYOUT="'##{window_layout#}'"
+GIVE_BACK="run-shell '$PLUGIN_DIR/bin/agentmux relayout ${SBW}'"
+SQ_SBW="set -wF -t ${SBW} ${O}wsq ${LAYOUT}"
+SQ_TW="set -wF -t ${TW} ${O}wsq ${LAYOUT}"
+# The follow joins the sidebar in right here, so it shows up with the window switch, and
+# gives the window it left back straight after.
+FOLLOW="${IF_SB_AT} \"${SQ_SBW} ; set -wF -t ${TW} ${O}wclean ${LAYOUT} ; ${JOIN} ; set -wF -t ${TW} ${O}wsq0 ${LAYOUT} ; ${SQ_TW} ; ${GIVE_BACK}\""
+# An eviction happens in the window you are looking at: `agentmux close` kills the sidebar
+# and gives the window back in one tmux command, which a format cannot, as the give-back
+# has to be computed first.
+SKIP="run-shell '$PLUGIN_DIR/bin/agentmux close ${SB} ${SBW}'"
+# A fix only re-places the sidebar within its window: the window's history stands, wsq
+# moves on.
+FIX="#{?#{E:${O}sb_ok},#{?#{E:${O}sb_wok},,${IF_SB_AT} \"resize-pane -x #{${O}width} -t ${SB} ; ${SQ_TW}\"},${IF_SB_AT} \"break-pane -d -s ${SB} ; ${JOIN} ; ${SQ_TW}\"}"
 # Exclusive branches so a generated command list never references a pane it just killed.
 # A skipped window evicts the sidebar but leaves @agentmux_on alone, so ensure_or_layout
 # brings it back as soon as the owner's window is no longer skipped.
-setg "${O}layout" "#{?${FOLLOW_COND},${JOIN},#{?${LONELY_COND},${IF_STILL_SB} \"kill-pane -t ${SB} ; ${ENSURE}\",#{?${SKIP_COND},${IF_STILL_SB} \"kill-pane -t ${SB}\",#{?${FIX_COND},${FIX},}}}}"
+setg "${O}layout" "#{?${FOLLOW_COND},${FOLLOW},#{?${LONELY_COND},${IF_STILL_SB} \"kill-pane -t ${SB} ; ${ENSURE}\",#{?${SKIP_COND},${SKIP},#{?${FIX_COND},${FIX},}}}}"
 # Forks `ensure` only when it would create a sidebar: on, none yet, and a target it may use.
 ENSURE_COND="#{&&:#{${O}on},#{&&:#{!:#{m:?*,${SB}}},#{&&:#{!:#{E:${O}tgt_zoom}},#{&&:#{E:${O}tgt_wide},#{!:#{E:${O}tgt_skip}}}}}}"
 setg "${O}ensure_or_layout" "#{?${ENSURE_COND},${ENSURE},#{E:${O}layout}}"
+
+# @agentmux_track, on window-layout-changed, covers the rest: changes made outside any
+# hook, i.e. the user's own. In a window holding the sidebar it moves wsq on, re-checking
+# when the command runs, as the sidebar may be gone by then and a late wsq would re-arm a
+# give-back already done. In a window without it, a set wsq means the sidebar was killed,
+# died or was moved by hand: give the window back now. (`toggle` kills the sidebar outside a
+# hook too, but takes the history with the kill and gives the window back itself.)
+HAS_SB="#{P:#{?#{${O}sidebar},1,}}"
+TRACK_SB="if -F -t #{window_id} \"##{P:##{?##{${O}sidebar#}#,1#,#}#}\" \"set -wF -t #{window_id} ${O}wsq ${LAYOUT}\""
+TRACK_GONE="run-shell '$PLUGIN_DIR/bin/agentmux relayout #{window_id}'"
+setg "${O}track" "#{?${HAS_SB},${TRACK_SB},#{?#{${O}wsq},${TRACK_GONE},}}"
+
 # Seen: a done pane you are looking at becomes idle. Always ends with the redraw signal so
 # the sidebar repaints.
 setg "${O}seen" "#{P:#{?#{&&:#{==:#{${O}state},done},#{&&:#{window_active},#{session_attached}}},set -p -t #{pane_id} ${O}state idle ; ,}}wait-for -S ${AGENTMUX_REDRAW_CHANNEL}"
@@ -172,11 +216,22 @@ hook 'window-pane-changed[70]' "if -F '#{${O}sidebar}' 'select-pane -l'"
 hook 'window-pane-changed[71]' "run-shell -C '#{E:${O}seen}'"
 hook 'window-pane-changed[72]' "run-shell -C '#{E:${O}ensure_or_layout}'"
 hook 'window-layout-changed[70]' "run-shell -C '#{E:${O}layout}'"
-hook 'after-select-layout[70]' "run-shell -C '#{E:${O}layout}'"
-hook 'after-kill-pane[70]' "run-shell -C '#{E:${O}layout}'"
+hook 'window-layout-changed[71]' "run-shell -C '#{E:${O}track}'"
+# A command hook runs in the queue of the command that fired it, and `run-shell -C` there
+# holds up the rest of that queue until the next event-loop turn. Only pay that when there
+# is something to do: then a command list that kills a pane and lays its window out again
+# (`agentmux close`) runs in one go, and tmux resizes each pane once.
+LAYOUT_IF_ANY="if -F '#{m:?*,#{E:${O}layout}}' \"run-shell -C '#{E:${O}layout}'\""
+hook 'after-select-layout[70]' "$LAYOUT_IF_ANY"
+hook 'after-kill-pane[70]' "$LAYOUT_IF_ANY"
 hook 'pane-exited[70]' "run-shell -C '#{E:${O}layout}'"
 # Skip formats usually read the pane title. Zero forks unless the sidebar must be re-created.
 hook 'pane-title-changed[70]' "run-shell -C '#{E:${O}ensure_or_layout}'"
+
+# A reload (tpm, source-file) must not leave history on a window the sidebar is not in: a
+# stale wsq would fire a give-back against whatever that window looks like by then.
+CLEAR_STALE="#{S:#{W:#{?${HAS_SB},,set -wu -t #{window_id} ${O}wclean ; set -wu -t #{window_id} ${O}wsq0 ; set -wu -t #{window_id} ${O}wsq ; }}}"
+tmux run-shell -C "$CLEAR_STALE"
 
 # ------------------------------------------------------------- key ----
 if [ -n "$KEY" ] && [ "$KEY" != off ]; then

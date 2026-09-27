@@ -6,6 +6,8 @@
 #   agentmux status [--gc]                                        show hook/tmux/scratch state
 #   agentmux toggle <client>                                      open/close the sidebar (bound to prefix+a)
 #   agentmux ensure                                               create the sidebar if on and missing
+#   agentmux close <pane-id> [<window-id>]                        internal: close the sidebar, giving its window back
+#   agentmux relayout <window-id>                                 internal: give a window the sidebar left its columns back
 #   agentmux notify <title> <body>                                desktop notification, no sound
 #
 # Config files: ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json, ${CODEX_HOME:-~/.codex}/hooks.json
@@ -226,7 +228,7 @@ cmd_status() {
 tmux_bin=""
 need_tmux() { tmux_bin=$(find_tmux) || die "tmux not found"; }
 
-# ensure lock: mkdir is atomic on every platform we care about; a stale lock (>10 s) is reclaimed.
+# ensure lock: mkdir is atomic on every platform we care about; a stale lock (>1 min) is reclaimed.
 lock_dir() {
   base=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
   base=${base%/}/agentmux-${USER:-${LOGNAME:-u}}
@@ -245,6 +247,77 @@ lock() {
 
 F_SB_PANE="#{E:${O}sb_pane}"
 sb_pane() { "$tmux_bin" display -p "$F_SB_PANE" 2>/dev/null; }
+
+# A window's give-back history (docs/CONTRACT.md, "Window options"), |-separated as no
+# layout string contains a |.
+F_HISTORY="#{${O}wclean}|#{${O}wsq0}"
+# Owed: wsq still set, the sidebar gone.
+F_OWED="#{&&:#{${O}wsq},#{!:#{P:#{?#{${O}sidebar},1,}}}}"
+# The panes that are not the sidebar, for `list-panes -F`: it lists them in pane-list order,
+# the order select-layout fills a layout's cells in. (#{P:} is no use here: tmux 3.7 sorts
+# its panes by creation.)
+F_PANE="#{?#{${O}sidebar},,#{pane_id}}"
+
+# read_panes: list-panes' output on stdin (one pane per line, blank for the sidebar) into
+# $panes, comma-separated as agentmux/relayout.py takes them.
+read_panes() {
+  panes=
+  while IFS= read -r p; do [ -z "$p" ] || panes=$panes$p,; done
+}
+
+# relayout CLEAN SQ0 SQ PANES: the give-back layout agentmux/relayout.py computes, or nothing.
+relayout() {
+  py=$(command -v python3 2>/dev/null) || return 0
+  "$py" "$PLUGIN_DIR/agentmux/relayout.py" "$@" 2>/dev/null
+  return 0
+}
+
+# fmt_str S: S as a literal inside a tmux format, e.g. the right-hand side of #{==:..}.
+fmt_str() { printf '%s' "$1" | sed 's/#/##/g; s/,/#,/g; s/}/#}/g'; }
+
+# give_back WINDOW CLEAN SQ0 SQ PANES: apply the give-back to a window the sidebar has
+# already left. The give-back commands run inside tmux hooks, where any output or a non-zero
+# exit would surface as an error, so they never fail.
+give_back() {
+  new=$(relayout "$2" "$3" "$4" "$5")
+  [ -n "$new" ] || return 0
+  # select-layout unzooms; zoom the same (active) pane again so the user's zoom survives.
+  "$tmux_bin" if -F -t "$1" '#{window_zoomed_flag}' \
+    "select-layout -t $1 '$new' ; resize-pane -Z -t $1" "select-layout -t $1 '$new'" 2>/dev/null
+  return 0
+}
+
+# close_sidebar PANE [WINDOW] [TMUX-CMDS]: kill the sidebar PANE, if it is still in WINDOW
+# when one is given, and give its window back, in one tmux command, along with TMUX-CMDS
+# (`;`-terminated). tmux folds the resizes a command makes into one per pane, so each pane's
+# program is resized once, straight to its final width, and no frame shows the sidebar's
+# columns lumped into one pane (as a kill followed by a give-back would, for the 250 ms
+# tmux holds a second resize back). The give-back is computed from a read of the window
+# first, so the command re-checks that the window has not changed since, and it all starts
+# over if it has.
+close_sidebar() {
+  sb=$1 where=${2:-} with=${3:-}
+  tries=0
+  while [ "$tries" -lt 5 ]; do
+    tries=$((tries + 1))
+    take=$("$tmux_bin" display -p -t "$sb" "#{window_id}|${F_HISTORY}|#{window_layout}" \; \
+      list-panes -t "$sb" -F "$F_PANE" 2>/dev/null) || return 0
+    { IFS='|' read -r win clean sq0 sq; read_panes; } <<EOF
+$take
+EOF
+    [ -z "$where" ] || [ "$win" = "$where" ] || return 0
+    close="${with}set -wu -t $win ${O}wclean ; set -wu -t $win ${O}wsq0 ; set -wu -t $win ${O}wsq ; kill-pane -t $sb"
+    new=$(relayout "$clean" "$sq0" "$sq" "$panes")
+    [ -z "$new" ] || close="$close ; select-layout -t $win '$new'"
+    unchanged="#{==:#{window_layout},$(fmt_str "$sq")}"
+    [ "$("$tmux_bin" if -F -t "$sb" "$unchanged" "$close ; display -p closed" 2>/dev/null)" = closed ] && return 0
+  done
+  # The window changed under every read (a border being dragged?): kill the sidebar with
+  # the history armed, and @agentmux_track gives the window back after the kill.
+  "$tmux_bin" if -F -t "$sb" "#{==:#{window_id},$win}" \
+    "${with}set -wF -t $win ${O}wsq '#{window_layout}' ; kill-pane -t $sb" 2>/dev/null
+  return 0
+}
 
 cmd_ensure() {
   need_tmux
@@ -276,13 +349,22 @@ cmd_ensure() {
   width=$("$tmux_bin" show -gqv "${O}width"); width=${width:-46}
   bg=$("$tmux_bin" show -gqv "${O}color_sidebar_bg"); bg=${bg:-default}
   py=$(command -v python3 2>/dev/null) || die "python3 not found"
-  new=$("$tmux_bin" split-window -bdfh -l "$width" -t "$win" -P -F '#{pane_id}' \
+  # The window's give-back history: its layout right before the split (taken in the same
+  # tmux command as the split) and right after it.
+  out=$("$tmux_bin" display -p -t "$win" '#{window_layout}' \; \
+    split-window -bdfh -l "$width" -t "$win" -P -F '#{pane_id}' \
     "exec $py $PLUGIN_DIR/bin/agentmux-sidebar") || return 1
+  { read -r clean; read -r new; } <<EOF
+$out
+EOF
   "$tmux_bin" set -p -t "$new" "${O}sidebar" 1 \; \
     select-pane -d -t "$new" \; \
     select-pane -T "$AGENTMUX_SIDEBAR_TITLE" -t "$new" \; \
     set -p -t "$new" window-style "bg=$bg" \; \
-    set -p -t "$new" window-active-style "bg=$bg"
+    set -p -t "$new" window-active-style "bg=$bg" \; \
+    set -w -t "$win" "${O}wclean" "$clean" \; \
+    set -wF -t "$win" "${O}wsq0" '#{window_layout}' \; \
+    set -wF -t "$win" "${O}wsq" '#{window_layout}'
 }
 
 cmd_toggle() {
@@ -290,12 +372,42 @@ cmd_toggle() {
   client=${1:-}
   sb=$(sb_pane)
   if [ -n "$sb" ]; then
-    "$tmux_bin" set -g "${O}on" 0 \; kill-pane -t "$sb"
+    # Off now, in case the sidebar goes before close_sidebar gets to it, and off again with
+    # the kill: a renderer still starting up turns the sidebar on (for tmux-resurrect).
+    # Synchronous, give-back included: a quick second toggle finds the window restored.
+    "$tmux_bin" set -g "${O}on" 0
+    close_sidebar "$sb" "" "set -g ${O}on 0 ; "
   else
     "$tmux_bin" set -g "${O}on" 1
     [ -n "$client" ] && "$tmux_bin" set -g "${O}owner" "$client"
     cmd_ensure
   fi
+}
+
+# Close the sidebar out of a window @agentmux_sidebar_skip keeps it out of (agentmux.tmux,
+# @agentmux_layout): what toggling off does, without turning the sidebar off.
+cmd_close() {
+  need_tmux
+  close_sidebar "${1:?agentmux close: pane id required}" "${2:-}"
+}
+
+# Give a window back the columns the sidebar borrowed from its panes, if it is owed that
+# (docs/CONTRACT.md, "Sidebar placement"): run by the follow in agentmux.tmux right after it
+# moves the sidebar away, and by @agentmux_track after the sidebar was killed or died. The
+# history is read and cleared in one tmux command, so however many calls race for one
+# departure, exactly one of them applies it.
+cmd_relayout() {
+  need_tmux
+  win=${1:?agentmux relayout: window id required}
+  take=$("$tmux_bin" display -p -t "$win" "#{?${F_OWED},1,0}|${F_HISTORY}|#{${O}wsq}" \; \
+    list-panes -t "$win" -F "$F_PANE" \; \
+    if -F -t "$win" "$F_OWED" "set -wu -t $win ${O}wclean ; set -wu -t $win ${O}wsq0 ; set -wu -t $win ${O}wsq" \
+    2>/dev/null) || return 0
+  { IFS='|' read -r owed clean sq0 sq; read_panes; } <<EOF
+$take
+EOF
+  [ "$owed" = 1 ] || return 0
+  give_back "$win" "$clean" "$sq0" "$sq" "$panes"
 }
 
 # ------------------------------------------------------------------------ notify ----
@@ -333,6 +445,8 @@ uninstall-hooks) cmd_uninstall_hooks "$@" ;;
 status) cmd_status "$@" ;;
 toggle) cmd_toggle "$@" ;;
 ensure) cmd_ensure "$@" ;;
+close) cmd_close "$@" ;;
+relayout) cmd_relayout "$@" ;;
 notify) cmd_notify "$@" ;;
 "" | -h | --help | help)
   # The header comment, whatever its length: every line after the shebang up to the first

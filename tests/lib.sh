@@ -19,15 +19,17 @@ assert_nonempty() { if [ -n "$2" ]; then ok; else ko "$1: expected a value"; fi;
 section() { printf '\n== %s\n' "$1"; }
 
 # poll_eq NAME EXPECTED CMD... : re-run CMD up to ~5 s until its output equals EXPECTED.
+# The poll_* helpers count in $_poll_n, not $i: POSIX sh has no `local`, and a caller's own
+# loop counter must survive a poll inside its loop.
 poll_eq() {
   name=$1 expect=$2
   shift 2
-  i=0
-  while [ $i -lt 50 ]; do
+  _poll_n=0
+  while [ $_poll_n -lt 50 ]; do
     got=$("$@" 2>/dev/null)
     [ "$got" = "$expect" ] && { ok; return 0; }
     sleep 0.1
-    i=$((i + 1))
+    _poll_n=$((_poll_n + 1))
   done
   ko "$name: expected [$expect] got [$got] (after 5 s)"
   return 1
@@ -36,12 +38,12 @@ poll_eq() {
 poll_nonempty() {
   name=$1
   shift
-  i=0
-  while [ $i -lt 50 ]; do
+  _poll_n=0
+  while [ $_poll_n -lt 50 ]; do
     got=$("$@" 2>/dev/null)
     [ -n "$got" ] && { ok; return 0; }
     sleep 0.1
-    i=$((i + 1))
+    _poll_n=$((_poll_n + 1))
   done
   ko "$name: still empty after 5 s"
   return 1
@@ -49,12 +51,12 @@ poll_nonempty() {
 poll_empty() {
   name=$1
   shift
-  i=0
-  while [ $i -lt 50 ]; do
+  _poll_n=0
+  while [ $_poll_n -lt 50 ]; do
     got=$("$@" 2>/dev/null)
     [ -z "$got" ] && { ok; return 0; }
     sleep 0.1
-    i=$((i + 1))
+    _poll_n=$((_poll_n + 1))
   done
   ko "$name: still [$got] after 5 s"
   return 1
