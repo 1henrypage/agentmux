@@ -1,11 +1,12 @@
 #!/bin/sh
 # End-to-end tests against real tmux servers (hermetic: private sockets, temp HOME/scratch).
-#   1. Claude hook state machine on a direct pane, badge/label/timer formats.
+#   1. Claude hook state machine on a direct pane, badge/label/timer/title formats.
 #   2. Codex state machine (kind codex, Interrupt -> idle).
-#   3. Nesting: inner tmux attached from an outer pane emits an AGX1 title, outer decodes it,
-#      re-embeds it, the sidebar lists the remote host; seen -> idle on the attached inner.
-#   4. Omnigent hop: private -S server attached from an outer pane, state lands on the outer pane.
-#   5. Sidebar: toggle, follow, bounce, fix, lonely, toggle off.
+#   3. Attached server: an inner tmux attached from an outer pane (section 5 runs on it); its
+#      agents stay on it; seen -> idle.
+#   4. Omnigent hop: private -S server attached from an outer pane, state lands on the outer
+#      pane; a private server with no client gets markers only.
+#   5. Sidebar: toggle, follow, bounce, fix, lonely, skip, toggle off.
 # shellcheck disable=SC2154,SC1010,SC2015
 set -u
 # shellcheck source=lib.sh
@@ -14,8 +15,6 @@ set -u
 GLY_BLOCKED='󰸇'
 GLY_DONE='󰄬'
 GLY_DELEG='󰀐'
-GLY_REMOTE='󰐠'
-HOST=$(hostname -s 2>/dev/null || hostname | cut -d. -f1)
 
 # ------------------------------------------------------------------ 1. claude direct ----
 section "claude direct"
@@ -121,12 +120,15 @@ t set -p -t "$P2" @agentmux_state blocked \; set -p -t "$P2" @agentmux_updated "
 assert_contains "shell gate hides state" "·" "$(t display -p -t "$P2" '#{E:@agentmux_badge}')"
 t kill-window -t "$P2"
 
-TITLE=$(t display -p '#{E:@agentmux_title_enc}')
-assert_contains "title_enc header" "AGX1|h=$HOST|t=" "$TITLE"
-assert_contains "title_enc entry" "|s=working|k=claude|p=src|" "$TITLE"
-assert_contains "title_enc target" "|w=lap:1.1|" "$TITLE"
-assert_not_contains "title_enc has no semicolon" ";" "$TITLE"
-assert_not_contains "title_enc has no hash" "#" "$TITLE"
+assert_eq "titles on by default" on "$(t show -gv set-titles)"
+assert_eq "title is the human fragment" '#{E:@agentmux_title_human}' "$(t show -gv set-titles-string)"
+# @agentmux_titles off hands set-titles to the user's config: a reload must not clobber it.
+t set -g @agentmux_titles off \; set -g set-titles-string custom
+t run-shell "$ROOT/agentmux.tmux"
+assert_eq "titles off leaves set-titles-string alone" custom "$(t show -gv set-titles-string)"
+t set -g @agentmux_titles on
+t run-shell "$ROOT/agentmux.tmux"
+assert_eq "titles on (re)claims set-titles-string" '#{E:@agentmux_title_human}' "$(t show -gv set-titles-string)"
 # (window names are only auto-renamed for attached clients, so only the shape is checked)
 HUMAN=$(t display -p -t "$P" '#{E:@agentmux_title_human}')
 assert_contains "title_human" "lap:" "$HUMAN"
@@ -170,45 +172,22 @@ assert_eq "codex done" done "$(opt "$P" state)"
 fire codex SessionEnd "$SP" "$PID" "$P"
 assert_empty "codex SessionEnd" "$(opt "$P" state)"
 
-# ------------------------------------------------------------------ 3. nesting ----
-section "nesting (inner tmux inside an outer pane)"
+# ------------------------------------------------------------------ 3. attached server ----
+section "attached server (inner tmux inside an outer pane)"
 OUTER=$(t new-window -d -P -F '#{pane_id}' -t lap: "unset TMUX; exec tmux -L $SOCK_IN -f $HERE/tmux.conf new -s main 'sleep 1000'")
 i=0
 while [ -z "$(tin show -gqv @agentmux_badge 2>/dev/null)" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
 assert_nonempty "inner server up" "$(tin show -gqv @agentmux_badge 2>/dev/null)"
-# Both servers run on this machine; give the inner one its own name so the outer's self-echo
-# filter (entries from the local host are dropped) does not hide it.
-tin set -g @agentmux_hostname devbox
-RHOST=devbox
 poll_eq "inner has one attached client" 1 tin display -p '#{session_attached}'
-assert_eq "inner client is a tmux terminal" tmux-256color "$(tin list-clients -F '#{client_termname}')"
 ISP=$(tin display -p '#{socket_path}')
 IPID=$(tin display -p '#{pid}')
 IP=$(tin display -p -t main:1 '#{pane_id}')
 fire claude SessionStart "$ISP" "$IPID" "$IP"
 fire claude UserPromptSubmit "$ISP" "$IPID" "$IP"
 assert_eq "inner working" working "$(optin "$IP" state)"
-poll_nonempty "outer pane title becomes AGX1" sh -c "tmux -L $SOCK display -p -t $OUTER '#{pane_title}' | grep '^AGX1|h=$RHOST|'"
-poll_eq "outer decoded r_worst" working t show -pqv -t "$OUTER" @agentmux_r_worst
-assert_eq "outer r_host" "$RHOST" "$(opt "$OUTER" r_host)"
-assert_eq "outer r_kind" claude "$(opt "$OUTER" r_kind)"
-assert_eq "outer r_proj" src "$(opt "$OUTER" r_proj)"
-assert_nonempty "outer r_exp" "$(opt "$OUTER" r_exp)"
-assert_contains "outer badge shows remote working" "●" "$(t display -p -t "$OUTER" '#{E:@agentmux_badge}')"
-assert_contains "outer label shows remote host" "$GLY_REMOTE $RHOST/#[fg=cyan]src" "$(t display -p -t "$OUTER" '#{E:@agentmux_label}')"
-RE=$(t display -p '#{E:@agentmux_title_enc}')
-assert_contains "outer re-embeds inner entry with x=0" "|w=main:1.1|" "$RE"
-assert_not_contains "re-embedded entry not marked visible" "|x=1|w=main:1.1|" "$RE"
-assert_not_contains "re-embedded title has no nested header" "~AGX1|" "$RE"
-SBO=$(python3 "$ROOT/bin/agentmux-sidebar" --once -L "$SOCK" --no-color --width 46 --height 20)
-assert_contains "sidebar --once lists remote host" " $RHOST" "$SBO"
-assert_contains "sidebar --once lists remote target" "main:1.1" "$SBO"
-assert_contains "sidebar --once shows the prompt" "fix the flaky test" "$SBO"
-
-# blocked remotely -> red on the outer within a heartbeat
-fire claude PermissionRequest "$ISP" "$IPID" "$IP"
-poll_eq "outer r_worst blocked" blocked t show -pqv -t "$OUTER" @agentmux_r_worst
-assert_contains "outer badge blocked" "$GLY_BLOCKED" "$(t display -p -t "$OUTER" '#{E:@agentmux_badge}')"
+# Local is local: the outer pane running the inner client shows nothing of its agents.
+assert_empty "inner agent stays off the outer pane" "$(t display -p -t "$OUTER" '#{E:@agentmux_pstate}')"
+assert_contains "outer tab stays idle" "·" "$(t display -p -t "$OUTER" '#{E:@agentmux_badge}')"
 
 # seen -> idle on the attached inner server
 IP2=$(tin new-window -d -P -F '#{pane_id}' -t main: 'sleep 1000')
@@ -216,57 +195,11 @@ fire claude SessionStart "$ISP" "$IPID" "$IP2"
 fire claude UserPromptSubmit "$ISP" "$IPID" "$IP2"
 fire claude Stop "$ISP" "$IPID" "$IP2"
 assert_eq "hidden window Stop -> done" done "$(optin "$IP2" state)"
-fire claude PostToolUse-match "$ISP" "$IPID" "$IP" PostToolUse
 fire claude Stop "$ISP" "$IPID" "$IP"
 assert_eq "viewed window Stop -> idle directly" idle "$(optin "$IP" state)"
 tin select-window -t main:2
 poll_eq "viewing the done window flips it idle" idle tin show -pqv -t "$IP2" @agentmux_state
 tin select-window -t main:1
-
-# An expired cache is invalid everywhere, not merely downgraded to an idle badge.
-# Stop accepting fresh heartbeats first so the synthetic expiry cannot race title-changed.
-t set-hook -gu 'pane-title-changed[70]'
-sleep 0.2
-t set -pu -t "$OUTER" @agentmux_r_seen \; set -p -t "$OUTER" @agentmux_r_exp 1
-assert_empty "expired remote has no effective state" "$(t display -p -t "$OUTER" '#{E:@agentmux_pstate}')"
-assert_empty "expired remote has no effective host" "$(t display -p -t "$OUTER" '#{E:@agentmux_phost}')"
-assert_not_contains "expired remote label omits host" "$RHOST/" "$(t display -p -t "$OUTER" '#{E:@agentmux_label}')"
-assert_empty "expired remote has no timer" "$(t display -p -t "$OUTER" '#{E:@agentmux_timer}')"
-EXPIRED_TITLE=$(t display -p '#{E:@agentmux_title_enc}')
-assert_not_contains "expired remote is not re-embedded" '|w=main:1.1|' "$EXPIRED_TITLE"
-
-# A local writer taking over a formerly remote pane clears the entire decoded cache in the
-# same transaction; the unchanged AGX1 title must not win over the new local state.
-FORMER=$(t new-window -d -P -F '#{pane_id}' -t lap: 'sleep 1000')
-OLD_TITLE='AGX1|h=oldhost|t=1|hb=0~h=oldhost|s=blocked|k=claude|p=oldproj|b=1|n=0|u=1|x=0|w=old:1.1|d=old~'
-t select-pane -T "$OLD_TITLE" -t "$FORMER" \; \
-  set -p -t "$FORMER" @agentmux_r_host oldhost \; \
-  set -p -t "$FORMER" @agentmux_r_n 1 \; \
-  set -p -t "$FORMER" @agentmux_r_worst blocked \; \
-  set -p -t "$FORMER" @agentmux_r_worst2 blocked \; \
-  set -p -t "$FORMER" @agentmux_r_deleg 0 \; \
-  set -p -t "$FORMER" @agentmux_r_proj oldproj \; \
-  set -p -t "$FORMER" @agentmux_r_kind claude \; \
-  set -p -t "$FORMER" @agentmux_r_start 1 \; \
-  set -p -t "$FORMER" @agentmux_r_exp 0 \; \
-  set -p -t "$FORMER" @agentmux_r_seen 1 \; \
-  set -p -t "$FORMER" @agentmux_r_done oldhost:old:1.1 \; \
-  set -p -t "$FORMER" @agentmux_r_prev "$OLD_TITLE" \; \
-  set -p -t "$FORMER" @agentmux_r_notified old
-fire claude SessionStart "$SP" "$PID" "$FORMER"
-fire claude UserPromptSubmit "$SP" "$PID" "$FORMER"
-remote_left=""
-for name in r_host r_n r_worst r_worst2 r_deleg r_proj r_kind r_start r_exp r_seen r_done r_prev r_notified; do
-  value=$(opt "$FORMER" "$name")
-  [ -z "$value" ] || remote_left="$remote_left $name=$value"
-done
-assert_empty "local write clears every remote cache option" "$remote_left"
-assert_eq "formerly remote pane shows local state" working "$(t display -p -t "$FORMER" '#{E:@agentmux_pstate}')"
-assert_eq "formerly remote pane shows local project" src "$(t display -p -t "$FORMER" '#{E:@agentmux_pproj}')"
-FORMER_LABEL=$(t display -p -t "$FORMER" '#{E:@agentmux_label}')
-assert_contains "formerly remote label shows local project" src "$FORMER_LABEL"
-assert_not_contains "formerly remote label omits old host" oldhost "$FORMER_LABEL"
-t kill-window -t "$FORMER"
 
 # ------------------------------------------------------------------ 4. omnigent hop ----
 section "omnigent hop (private -S server)"
@@ -282,12 +215,25 @@ fire claude UserPromptSubmit "$OM_SOCK" "$OPID" "$OIP"
 assert_eq "hop: state lands on the outer pane" working "$(opt "$OMP" state)"
 assert_eq "hop: kind on the outer pane" claude "$(opt "$OMP" kind)"
 assert_empty "hop: nothing written on the private server" "$(tom show -pqv -t "$OIP" @agentmux_state)"
-assert_not_contains "hop: no AGX1 title on the outer pane" "AGX1" "$(t display -p -t "$OMP" '#{pane_title}')"
 [ -s "$XDG_RUNTIME_DIR/agentmux-${USER:-u}/$OPID/${OIP#%}/outer" ] && ok || ko "hop cache written"
 fire claude Stop "$OM_SOCK" "$OPID" "$OIP"
 assert_eq "hop: Stop -> done on the outer pane" done "$(opt "$OMP" state)"
 fire claude SessionEnd "$OM_SOCK" "$OPID" "$OIP"
 assert_empty "hop: SessionEnd clears the outer pane" "$(opt "$OMP" state)"
+
+# A private server nobody is attached to (omnigent's web-only view): markers only.
+tweb -f /dev/null new -d -s web 'sleep 1000'
+WPID=$(tweb display -p '#{pid}')
+WP=$(tweb display -p '#{pane_id}')
+WDIR=$XDG_RUNTIME_DIR/agentmux-${USER:-u}/$WPID/${WP#%}
+fire claude SessionStart "$WEB_SOCK" "$WPID" "$WP"
+fire claude UserPromptSubmit "$WEB_SOCK" "$WPID" "$WP"
+assert_eq "no client: the scratch state still advances" working "$(cat "$WDIR/state" 2>/dev/null)"
+case $(cat "$WDIR/start" 2>/dev/null) in [1-9]*) ok ;; *) ko "no client: start resolves to an epoch" ;; esac
+assert_empty "no client: nothing written on the private server" "$(tweb show -pqv -t "$WP" @agentmux_state)"
+fire claude SessionEnd "$WEB_SOCK" "$WPID" "$WP"
+[ -d "$WDIR" ] && ko "no client: SessionEnd wipes the scratch dir" || ok
+tweb kill-server
 
 # ------------------------------------------------------------------ 5. sidebar ----
 section "sidebar (on the attached inner server)"
@@ -305,6 +251,14 @@ assert_eq "sidebar title" agentmux-sidebar "$(tin display -p -t "$SB" '#{pane_ti
 assert_eq "sidebar in the current window" "$(tin display -p '#{window_id}')" "$(tin display -p -t "$SB" '#{window_id}')"
 assert_ne "sidebar not active" "$SB" "$(tin display -p '#{pane_id}')"
 poll_eq "renderer marked itself (survives ensure)" 1 tin show -pqv -t "$SB" @agentmux_sidebar
+
+# Hooks run in their target's context: a title change or a split in a background window must
+# not drag the sidebar there (it tracks the owner's current window, not the hook's).
+tin select-pane -T retitled -t "$IP2"
+BGSPLIT=$(tin split-window -d -P -F '#{pane_id}' -t "$IP2" 'sleep 1000')
+sleep 0.3
+assert_eq "hooks for a background window leave the sidebar alone" "$(tin display -p '#{window_id}')" "$(tin display -p -t "$SB" '#{window_id}')"
+tin kill-pane -t "$BGSPLIT"
 
 tin select-window -t main:2
 poll_eq "sidebar follows select-window" "$(tin display -p -t main:2 '#{window_id}')" tin display -p -t "$SB" '#{window_id}'
@@ -339,13 +293,47 @@ poll_eq "zoom/unzoom in place keeps the sidebar" "$W2" tin display -p -t "$SB" '
 poll_eq "unzoom restores the width" 46 tin display -p -t "$SB" '#{pane_width}'
 assert_eq "unzoom restores the left position" 0 "$(tin display -p -t "$SB" '#{pane_left}')"
 
-# lonely: kill the only other pane in the sidebar's window (window 2 = $IP2 + sidebar)
-tin kill-pane -t "$IP2"
+# lonely: kill the only other pane in the sidebar's window (window 2 = $IP2 + sidebar). Two
+# hooks race to evict the lonely sidebar; the loser must not fail the user's kill-pane.
+assert_empty "killing the sidebar's last neighbour reports no error" "$(tin kill-pane -t "$IP2" 2>&1)"
 poll_nonempty "lonely sidebar is replaced by a new one" sh -c "tmux -L $SOCK_IN display -p '#{E:@agentmux_sb_pane}' | grep -v '^$SB\$'"
 SB2=$got
 assert_eq "new sidebar in the current window" "$(tin display -p '#{window_id}')" "$(tin display -p -t "$SB2" '#{window_id}')"
 poll_eq "new sidebar marked" 1 tin show -pqv -t "$SB2" @agentmux_sidebar
 assert_eq "exactly one sidebar" 1 "$(tin list-panes -a -F '#{@agentmux_sidebar}' | grep -c 1)"
+
+# Skip: @agentmux_sidebar_skip keeps the sidebar out of the owner's window while that window's
+# active pane matches; @agentmux_on stays 1 so it comes back as soon as it stops matching.
+tin set -g @agentmux_sidebar_skip '#{m:SKIPME*,#{pane_title}}'
+SKW=$(tin display -p '#{window_id}')
+SKP=$(tin display -p '#{pane_id}')
+tin select-pane -T SKIPME -t "$SKP"
+poll_empty "retitling the target pane evicts the sidebar" tin display -p '#{E:@agentmux_sb_pane}'
+assert_eq "sidebar stays on while evicted" 1 "$(tin show -gqv @agentmux_on)"
+tin select-pane -T plain -t "$SKP"
+poll_nonempty "retitling it back re-creates the sidebar" tin display -p '#{E:@agentmux_sb_pane}'
+assert_eq "re-created in the current window" "$SKW" "$(tin display -p -t "$got" '#{window_id}')"
+poll_eq "re-created sidebar marked" 1 tin show -pqv -t "$got" @agentmux_sidebar
+
+# The active pane decides: moving onto a skipped split evicts, moving off re-creates.
+SPLIT=$(tin split-window -d -P -F '#{pane_id}' -t "$SKP" 'sleep 1000')
+tin select-pane -T SKIPME -t "$SPLIT"
+tin select-pane -t "$SPLIT"
+poll_empty "selecting a skipped pane evicts the sidebar" tin display -p '#{E:@agentmux_sb_pane}'
+tin select-pane -t "$SKP"
+poll_nonempty "selecting a plain pane re-creates it" tin display -p '#{E:@agentmux_sb_pane}'
+SB3=$got
+tin kill-pane -t "$SPLIT"
+
+# A skipped window is never followed into: the sidebar waits where it is.
+SKW2=$(tin new-window -d -P -F '#{window_id}' -t main: 'sleep 1000')
+tin select-pane -T SKIPME -t "$SKW2"
+tin select-window -t "$SKW2"
+sleep 0.3
+assert_eq "the sidebar does not follow into a skipped window" "$SKW" "$(tin display -p -t "$SB3" '#{window_id}')"
+tin select-window -t "$SKW"
+tin kill-window -t "$SKW2"
+tin set -gu @agentmux_sidebar_skip
 
 tin run-shell "$ROOT/bin/agentmux toggle '$CLIENT'"
 poll_empty "toggle removes the sidebar" tin display -p '#{E:@agentmux_sb_pane}'

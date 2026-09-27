@@ -70,17 +70,20 @@ export CLAUDE_CONFIG_DIR="$WORK/claude"
 export CODEX_HOME="$WORK/codex"
 export AGENTMUX_DIR="$ROOT"
 mkdir -p "$HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
-unset TMUX TMUX_PANE CLAUDE_PROJECT_DIR SSH_CONNECTION SSH_TTY AGENTMUX_TITLE
+unset TMUX TMUX_PANE CLAUDE_PROJECT_DIR
 SOCK=agx-e2e-$$
 SOCK_IN=agx-in-$$
 OM_SOCK=$WORK/om.sock
+WEB_SOCK=$WORK/web.sock
 t() { tmux -L "$SOCK" "$@"; }
 tin() { tmux -L "$SOCK_IN" "$@"; }
 tom() { tmux -S "$OM_SOCK" "$@"; }
+tweb() { tmux -S "$WEB_SOCK" "$@"; }
 cleanup() {
   t kill-server 2>/dev/null
   tin kill-server 2>/dev/null
   tom kill-server 2>/dev/null
+  tweb kill-server 2>/dev/null
   rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM

@@ -1,9 +1,9 @@
-"""agentmux sidebar renderer: one pane per tmux server listing every agent it can see.
+"""agentmux sidebar renderer: one pane per tmux server listing every agent on it.
 
-Data: one ``tmux list-panes -a -F`` per tick (fields from :data:`FIELDS`), local agents from
-their ``@agentmux_*`` pane options, remote agents decoded from ssh panes' AGX1 titles. Wake-ups
-come from a second-aligned timer, a ``tmux wait-for agentmux-redraw`` latch the hooks signal,
-and SIGWINCH. Output is a line-level diff repaint on the alternate screen.
+Data: one ``tmux list-panes -a -F`` per tick (fields from :data:`FIELDS`), agents from their
+``@agentmux_*`` pane options. Wake-ups come from a second-aligned timer, a ``tmux wait-for
+agentmux-redraw`` latch the hooks signal, and SIGWINCH. Output is a line-level diff repaint on
+the alternate screen.
 """
 
 from __future__ import annotations
@@ -23,18 +23,15 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
-from agentmux import titlecodec as tc
-
 OPT = "@agentmux_"
 SEP = "\x1f"
 REDRAW_CHANNEL = "agentmux-redraw"
 SIDEBAR_TITLE = "agentmux-sidebar"
 SHELLS = frozenset({"zsh", "bash", "fish", "sh", "dash", "ksh", "nu"})
 SHELL_GRACE = 15  # seconds a just-exited agent keeps its row while the shell is back
-HOST_FORGET = 60  # seconds an absent remote host keeps its position in the group order
 DEFAULT_TTL = 14400
+STATES = ("blocked", "done", "delegating", "working", "idle")  # worst first
+PRIORITY = {s: i for i, s in enumerate(STATES)}
 
 FIELDS: tuple[tuple[str, str], ...] = (
     ("pane_id", "#{pane_id}"),
@@ -49,7 +46,6 @@ FIELDS: tuple[tuple[str, str], ...] = (
     ("pane_active", "#{pane_active}"),
     ("pane_dead", "#{pane_dead}"),
     ("pane_current_command", "#{pane_current_command}"),
-    ("pane_title", "#{pane_title}"),
     ("pane_width", "#{pane_width}"),
     ("pane_height", "#{pane_height}"),
     ("state", "#{" + OPT + "state}"),
@@ -60,10 +56,7 @@ FIELDS: tuple[tuple[str, str], ...] = (
     ("detail", "#{" + OPT + "detail}"),
     ("sid", "#{" + OPT + "sid}"),
     ("updated", "#{" + OPT + "updated}"),
-    ("host", "#{" + OPT + "host}"),
     ("sidebar", "#{" + OPT + "sidebar}"),
-    ("r_seen", "#{" + OPT + "r_seen}"),
-    ("r_exp", "#{" + OPT + "r_exp}"),
 )
 FIELD_NAMES = tuple(n for n, _ in FIELDS)
 LIST_FORMAT = SEP.join(f for _, f in FIELDS)
@@ -74,8 +67,6 @@ GLYPH = {
     "blocked": "\U000f0e07",  # nf-md-hand_back_right
     "done": "\U000f012c",  # nf-md-check
     "delegating": "\U000f0010",  # nf-md-account-multiple
-    "local": "\U000f0322",  # nf-md-laptop
-    "remote": "\U000f048b",  # nf-md-server
     "ellipsis": "…",
     "rule": "─",
     "sep": "·",
@@ -88,7 +79,6 @@ COLOR_KEYS = (
     "idle",
     "project",
     "agent",
-    "remote",
     "text",
     "fg",
     "dim",
@@ -102,7 +92,6 @@ DEFAULT_COLORS = {
     "idle": "colour240",
     "project": "cyan",
     "agent": "colour245",
-    "remote": "blue",
     "text": "white",
     "fg": "default",
     "dim": "colour240",
@@ -207,7 +196,6 @@ class Theme:
 
 @dataclass
 class Agent:
-    host: str  # "" = local
     target: str
     project: str
     kind: str
@@ -222,18 +210,14 @@ class Agent:
 
     @property
     def priority(self) -> int:
-        return tc.PRIORITY.get(self.state, 99)
+        return PRIORITY.get(self.state, 99)
 
 
 @dataclass
 class Model:
-    groups: list[tuple[str, list[Agent]]] = field(default_factory=list)
+    agents: list[Agent] = field(default_factory=list)  # worst first
     counts: dict[str, int] = field(default_factory=dict)
     now: int = 0
-
-    @property
-    def agents(self) -> list[Agent]:
-        return [a for _, group in self.groups for a in group]
 
 
 def _int(v: str, default: int = 0) -> int:
@@ -259,114 +243,45 @@ def is_shell(cmd: str) -> bool:
     return cmd.lstrip("-") in SHELLS
 
 
-class HostOrder:
-    """Remembers where each remote host sits in the list; forgets after HOST_FORGET s."""
-
-    def __init__(self) -> None:
-        self.seen: dict[str, float] = {}
-        self.order: list[str] = []
-
-    def touch(self, hosts: list[str], now: float) -> list[str]:
-        for h in list(self.order):
-            if now - self.seen.get(h, 0) > HOST_FORGET:
-                self.order.remove(h)
-                self.seen.pop(h, None)
-        for h in hosts:
-            if h not in self.seen:
-                self.order.append(h)
-            self.seen[h] = now
-        return [h for h in self.order if h in hosts]
-
-
 def build_model(
     rows: list[dict[str, str]],
     now: float,
     self_pane: str,
-    local_host: str,
     ttl: int = DEFAULT_TTL,
-    host_order: HostOrder | None = None,
 ) -> Model:
     now_i = int(now)
-    seen_keys: set[tuple[str, str]] = set()
+    seen: set[str] = set()
     agents: list[Agent] = []
     for r in rows:
         if r["pane_id"] == self_pane or r["pane_dead"] == "1" or r["sidebar"] == "1":
             continue
-        cmd = r["pane_current_command"]
-        shell = is_shell(cmd)
-        target = f"{r['session_name']}:{r['window_index']}.{r['pane_index']}"
+        # A pane in a window shared by grouped sessions is listed once per session.
+        if not r["state"] or r["pane_id"] in seen:
+            continue
         updated = _int(r["updated"])
-        if r["state"] and (not shell or (updated and now_i - updated < SHELL_GRACE)):
-            state = r["state"]
-            if state not in tc.STATES:
-                state = "idle"
-            if updated and now_i - updated > ttl:
-                state = "idle"
-            key = ("", target)
-            if key not in seen_keys:
-                seen_keys.add(key)
-                agents.append(
-                    Agent(
-                        host="",
-                        target=target,
-                        project=r["project"],
-                        kind=r["kind"],
-                        state=state,
-                        start=_int(r["start"]) if state not in ("idle", "done") else 0,
-                        updated=updated,
-                        subagents=_int(r["subagents"]),
-                        detail=r["detail"],
-                        pane_id=r["pane_id"],
-                        session=r["session_name"],
-                        window=_int(r["window_index"]),
-                    )
-                )
+        if is_shell(r["pane_current_command"]) and not (updated and now_i - updated < SHELL_GRACE):
             continue
-        if tc.is_title(r["pane_title"]) and not shell:
-            exp = _int(r["r_exp"])
-            if exp and exp < now_i:
-                continue
-            decoded = tc.decode(r["pane_title"])
-            if decoded is None:
-                continue
-            seen = r["r_seen"] == "1"
-            for e in decoded.entries:
-                if e.host == local_host or not e.host:
-                    continue
-                key = (e.host, e.target or f"@{r['pane_id']}")
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                state = "idle" if (e.state == "done" and seen) else e.state
-                agents.append(
-                    Agent(
-                        host=e.host,
-                        target=e.target or "-",
-                        project=e.project,
-                        kind=e.kind,
-                        state=state,
-                        start=e.start if state not in ("idle", "done") else 0,
-                        updated=e.updated,
-                        subagents=e.subagents,
-                        detail=e.detail,
-                        pane_id=r["pane_id"],
-                        session=r["session_name"],
-                        window=_int(r["window_index"]),
-                    )
-                )
-    remote_hosts: list[str] = []
-    for a in agents:
-        if a.host and a.host not in remote_hosts:
-            remote_hosts.append(a.host)
-    if host_order is not None:
-        remote_hosts = host_order.touch(remote_hosts, now)
-    model = Model(now=now_i)
-    for host in ["", *remote_hosts]:
-        group = [a for a in agents if a.host == host]
-        if not group:
-            continue
-        group.sort(key=lambda a: (a.priority, -a.updated, a.session, a.window, a.target))
-        model.groups.append((host, group))
+        seen.add(r["pane_id"])
+        state = r["state"] if r["state"] in STATES else "idle"
+        if updated and now_i - updated > ttl:
+            state = "idle"
+        agents.append(
+            Agent(
+                target=f"{r['session_name']}:{r['window_index']}.{r['pane_index']}",
+                project=r["project"],
+                kind=r["kind"],
+                state=state,
+                start=_int(r["start"]) if state not in ("idle", "done") else 0,
+                updated=updated,
+                subagents=_int(r["subagents"]),
+                detail=r["detail"],
+                pane_id=r["pane_id"],
+                session=r["session_name"],
+                window=_int(r["window_index"]),
+            )
+        )
+    agents.sort(key=lambda a: (a.priority, -a.updated, a.session, a.window, a.target))
+    model = Model(agents=agents, now=now_i)
     for a in agents:
         model.counts[a.state] = model.counts.get(a.state, 0) + 1
     return model
@@ -425,7 +340,7 @@ def render(
     # header: " agents" + right-aligned count pills, worst state first
     pills = []
     pill_width = 0
-    for state in tc.STATES:
+    for state in STATES:
         n = model.counts.get(state, 0)
         if n:
             piece = f"{GLYPH[state]} {n}"
@@ -441,51 +356,36 @@ def render(
         frame.text(left)
     frame.text(GLYPH["rule"] * width, "dim")
 
-    if not model.groups:
+    if not model.agents:
         frame.text(" no agents", "dim")
     per_agent = 1 if density == "compact" else 2
     total = len(model.agents)
-    needed = sum(1 + per_agent * len(g) for _, g in model.groups)
-    fits = len(frame.lines) + needed <= height
+    fits = len(frame.lines) + per_agent * total <= height
     limit = height if fits else height - 1  # keep a line for the "+N more" footer
     shown = 0
-    for host, group in model.groups:
-        if len(frame.lines) + 1 + per_agent > limit:
+    for a in model.agents:
+        if len(frame.lines) + per_agent > limit:
             break
-        if host:
-            frame.add(
-                [
-                    (" " + GLYPH["remote"] + " ", 3, "remote", "left"),
-                    (host, width - 3, "remote", "left"),
-                ]
-            )
-        else:
-            frame.add(
-                [(" " + GLYPH["local"] + " ", 3, "fg", "left"), ("local", width - 3, "fg", "left")]
-            )
-        for a in group:
-            if len(frame.lines) + per_agent > limit:
-                break
-            elapsed = fmt_elapsed(now - a.start) if a.start else ""
-            # "  <icon> <target 8> <project:kind 25> <elapsed 6> " = 3+9+1+25+7+1 cells
-            label_w = width - 21
-            proj = a.project or "?"
-            pw = min(label_w, max(str_width(proj), 1))
-            frame.rows.append((len(frame.lines), f"{a.host}|{a.target}", a.pane_id))
-            frame.add(
-                [
-                    ("  " + GLYPH[a.state], 3, a.state, "left"),
-                    (" " + a.target, 9, "dim", "left"),
-                    (" ", 1, "fg", "left"),
-                    (proj, pw, "project", "left"),
-                    *_kind_segments(a, label_w - pw),
-                    (" " + elapsed, 7, "text", "right"),
-                    (" ", 1, "fg", "left"),
-                ]
-            )
-            if per_agent == 2:
-                frame.add(_detail_segments(a, width, now))
-            shown += 1
+        elapsed = fmt_elapsed(now - a.start) if a.start else ""
+        # "  <icon> <target 8> <project:kind 25> <elapsed 6> " = 3+9+1+25+7+1 cells
+        label_w = width - 21
+        proj = a.project or "?"
+        pw = min(label_w, max(str_width(proj), 1))
+        frame.rows.append((len(frame.lines), a.target, a.pane_id))
+        frame.add(
+            [
+                ("  " + GLYPH[a.state], 3, a.state, "left"),
+                (" " + a.target, 9, "dim", "left"),
+                (" ", 1, "fg", "left"),
+                (proj, pw, "project", "left"),
+                *_kind_segments(a, label_w - pw),
+                (" " + elapsed, 7, "text", "right"),
+                (" ", 1, "fg", "left"),
+            ]
+        )
+        if per_agent == 2:
+            frame.add(_detail_segments(a, width, now))
+        shown += 1
     hidden = total - shown
     if hidden > 0:
         frame.text(f" +{hidden} more", "dim")
@@ -673,10 +573,9 @@ class Waker:
                 self.proc.terminate()
 
 
-def read_theme(tmux: Tmux) -> tuple[dict[str, str], str, int, int, str]:
+def read_theme(tmux: Tmux) -> tuple[dict[str, str], int, int, str]:
     fields = [f"#{{{OPT}color_{k}}}" for k in COLOR_KEYS]
     fields += [
-        f"#{{?#{{{OPT}hostname}},#{{{OPT}hostname}},#{{host_short}}}}",
         f"#{{{OPT}width}}",
         f"#{{{OPT}ttl}}",
         f"#{{{OPT}sidebar_density}}",
@@ -686,11 +585,10 @@ def read_theme(tmux: Tmux) -> tuple[dict[str, str], str, int, int, str]:
     if len(parts) != len(fields):
         parts = [""] * len(fields)
     colors = {k: parts[i] for i, k in enumerate(COLOR_KEYS)}
-    host = parts[len(COLOR_KEYS)]
-    width = _int(parts[len(COLOR_KEYS) + 1], 46)
-    ttl = _int(parts[len(COLOR_KEYS) + 2], DEFAULT_TTL)
-    density = parts[len(COLOR_KEYS) + 3] or "full"
-    return colors, host, width, ttl, density
+    width = _int(parts[len(COLOR_KEYS)], 46)
+    ttl = _int(parts[len(COLOR_KEYS) + 1], DEFAULT_TTL)
+    density = parts[len(COLOR_KEYS) + 2] or "full"
+    return colors, width, ttl, density
 
 
 def scratch_dir(server_pid: str) -> str:
@@ -727,7 +625,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--now", type=float, help="epoch to use as 'now' (tests)")
     ap.add_argument("--input", help="tab-separated pane rows instead of tmux (tests)")
-    ap.add_argument("--host", default=None, help="local host_short override (tests)")
     ap.add_argument("--print-format", action="store_true")
     ap.add_argument("--density", choices=("full", "compact"))
     ap.add_argument("-L", dest="socket_name")
@@ -759,10 +656,9 @@ def main(argv: list[str] | None = None) -> int:
         height = args.height or 24
         ttl = DEFAULT_TTL
         density = args.density or "full"
-        host = args.host or "local"
     else:
         try:
-            colors, host, width, ttl, density = read_theme(tmux)
+            colors, width, ttl, density = read_theme(tmux)
         except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
             print(f"agentmux-sidebar: cannot reach tmux: {exc}", file=sys.stderr)
             return 1
@@ -770,14 +666,13 @@ def main(argv: list[str] | None = None) -> int:
         width = args.width or width
         density = args.density or density
         height = args.height or 24
-        host = args.host or host
         rows = None
 
     if args.once:
         if rows is None:
             rows = tmux.list_panes()
         now = args.now or time.time()
-        model = build_model(rows, now, self_pane, host, ttl)
+        model = build_model(rows, now, self_pane, ttl)
         frame = render(model, width, height, theme, density)
         sys.stdout.write("\n".join(frame.lines) + "\n")
         return 0
@@ -785,14 +680,13 @@ def main(argv: list[str] | None = None) -> int:
     if not self_pane:
         print("agentmux-sidebar: must run inside a tmux pane ($TMUX_PANE unset)", file=sys.stderr)
         return 1
-    return run_forever(tmux, self_pane, theme, host, ttl, density, args)
+    return run_forever(tmux, self_pane, theme, ttl, density, args)
 
 
 def run_forever(
     tmux: Tmux,
     self_pane: str,
     theme: Theme,
-    host: str,
     ttl: int,
     density: str,
     args: argparse.Namespace,
@@ -859,7 +753,6 @@ def run_forever(
     rows_path = os.path.join(scratch_dir(server_pid), "sidebar.rows")
     term = Term()
     waker = Waker(tmux)
-    host_order = HostOrder()
     reload_theme = threading.Event()
 
     def on_usr1(*_: object) -> None:
@@ -883,7 +776,7 @@ def run_forever(
             if reload_theme.is_set():
                 reload_theme.clear()
                 try:
-                    colors, host, _w, ttl, density = read_theme(tmux)
+                    colors, _w, ttl, density = read_theme(tmux)
                     theme = Theme(colors, enabled=not args.no_color)
                     width = args.width or 0
                     full = True
@@ -906,7 +799,7 @@ def run_forever(
                     break
                 continue
             now = time.time()
-            model = build_model(rows, now, self_pane, host, ttl, host_order)
+            model = build_model(rows, now, self_pane, ttl)
             me = next((r for r in rows if r["pane_id"] == self_pane), None)
             visible = (
                 bool(me) and me["window_active"] == "1" and me["session_attached"] not in ("", "0")

@@ -5,7 +5,6 @@
 # shellcheck disable=SC2034
 AGENTMUX_PLUGIN=agentmux
 AGENTMUX_OPT=@agentmux_
-AGENTMUX_MAGIC=AGX1
 AGENTMUX_SIDEBAR_TITLE=agentmux-sidebar
 AGENTMUX_REDRAW_CHANNEL=agentmux-redraw
 AGENTMUX_SAN_MAX=24

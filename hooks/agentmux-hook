@@ -14,7 +14,6 @@
 # builtin and a failed redirection on it aborts a non-interactive sh.
 
 AGX_OPT=@agentmux_
-AGX_MAGIC=AGX1
 AGX_SAN_MAX=24
 AGX_REDRAW=agentmux-redraw
 
@@ -198,7 +197,8 @@ $ctty "}
 }
 
 # Hop from a private (omnigent) server to the pane that displays it, depth <= 3.
-# Result: mode=hop (outer_sock, outer_pane, ctty) | title (ctty) | none (web-only).
+# Result: mode=hop (outer_sock, outer_pane, ctty) | none (web-only, or a client whose
+# terminal is not a pane on any tmux server we can reach).
 resolve_hop() {
   cur=$sock
   depth=0
@@ -215,10 +215,10 @@ resolve_hop() {
       depth=$((depth + 1))
       continue
     fi
-    mode=title
+    mode=none
     return
   done
-  mode=title
+  mode=none
 }
 
 # Decide how this agent is displayed. Sets $mode and, for direct/hop, $pane (+ $outer_sock).
@@ -226,7 +226,6 @@ resolve_display() {
   mode=""
   outer_sock=""
   sock=${TMUX%%,*}
-  if [ -z "$TMUX" ]; then mode=bare; return; fi
   case $sock in
   */tmux-[0-9]*/*) mode=direct; pane=$TMUX_PANE; return ;;
   esac
@@ -245,11 +244,11 @@ resolve_display() {
   esac
 }
 
-# One read round-trip against the display server. Sets ptty wact satt pcmd host now
-# notify notify_done clients. Returns 1 when the pane is gone.
+# One read round-trip against the display server. Sets ptty wact satt pcmd now notify
+# notify_done clients. Returns 1 when the pane is gone.
 read_pane() {
   info=$(tm display -p -t "$pane" \
-    "#{pane_tty}|#{window_active}|#{session_attached}|#{pane_current_command}|#{?#{${AGX_OPT}hostname},#{${AGX_OPT}hostname},#{host_short}}|%s|#{${AGX_OPT}notify}|#{${AGX_OPT}notify_done}" \; \
+    "#{pane_tty}|#{window_active}|#{session_attached}|#{pane_current_command}|%s|#{${AGX_OPT}notify}|#{${AGX_OPT}notify_done}" \; \
     list-clients -F '#{?client_control_mode,,#{client_name}}' 2>/dev/null) || return 1
   line=${info%%
 *}
@@ -260,27 +259,10 @@ read_pane() {
   wact=${line%%|*}; line=${line#*|}
   satt=${line%%|*}; line=${line#*|}
   pcmd=${line%%|*}; line=${line#*|}
-  host=${line%%|*}; line=${line#*|}
   now=${line%%|*}; line=${line#*|}
   notify=${line%%|*}; line=${line#*|}
   notify_done=$line
   [ -n "$now" ]
-}
-
-# Time + host without a display server: two forks, once per event, cold paths only.
-bare_clock() {
-  now=$(date +%s)
-  # shellcheck disable=SC3028
-  h=${HOSTNAME:-}
-  [ -n "$h" ] || { read -r h </proc/sys/kernel/hostname; } 2>/dev/null || h=""
-  [ -n "$h" ] || h=$(hostname 2>/dev/null)
-  host=${h%%.*}
-}
-
-emit_title() {
-  # $1 = tty device, $2 = entry ("" for an empty aggregate)
-  [ -w "$1" ] || return 0
-  printf '\033]2;%s|h=%s|t=%s|hb=0~%s\007' "$AGX_MAGIC" "$host" "$((now / 60))" "$2" >"$1"
 }
 
 # ------------------------------------------------------------------------------ main ----
@@ -291,18 +273,16 @@ main() {
   case $kind in claude | codex) ;; *) return ;; esac
   case ${CLAUDE_CODE_ENTRYPOINT:-cli} in cli) ;; *) return ;; esac
 
+  # Outside tmux there is no pane to show the agent on.
+  [ -n "$TMUX" ] && [ -n "$TMUX_PANE" ] || return
   base=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
   base=${base%/}/agentmux-${USER:-${LOGNAME:-u}}
-  key=""
-  if [ -n "$TMUX" ] && [ -n "$TMUX_PANE" ]; then
-    p=${TMUX#*,}
-    key=${p%%,*}/${TMUX_PANE#%}
-  fi
-  dir=$base/$key
+  p=${TMUX#*,}
+  dir=$base/${p%%,*}/${TMUX_PANE#%}
 
   # PostToolUse only matters while blocked: skip the stdin read entirely otherwise.
   case $ev in
-  PostToolUse*) if [ -n "$key" ] && ! [ -s "$dir/blocked" ]; then return; fi ;;
+  PostToolUse*) [ -s "$dir/blocked" ] || return ;;
   esac
 
   input=""
@@ -322,15 +302,6 @@ main() {
   jget notification_type; ntype=$v
   jget source; source=$v
   jget prompt; prompt=$v
-
-  if [ -z "$key" ]; then
-    san "$sid" 40
-    key=nosrv/${san_out:-anon}
-    dir=$base/$key
-  fi
-  case $ev in
-  PostToolUse*) [ -s "$dir/blocked" ] || return ;;
-  esac
 
   case $event in
   SessionStart)
@@ -456,35 +427,24 @@ main() {
   # ---- find the pane that displays this agent ------------------------------------------
   tmux_bin=""
   outer_sock=""
-  find_tmux || :
-  if [ -n "$tmux_bin" ]; then resolve_display; else mode=bare; fi
+  if find_tmux; then resolve_display; else mode=none; fi
 
-  case $mode in
-  direct | hop)
-    if ! read_pane; then
-      [ "$mode" = hop ] || return
-      force_resolve=1; resolve_display; [ "$mode" = hop ] || return
-      read_pane || return
-    fi
-    if [ "$mode" = hop ] && [ "$force_resolve" != 1 ] && { [ "$ptty" != "$ctty" ] || is_shell "$pcmd"; }; then
-      force_resolve=1; resolve_display; [ "$mode" = hop ] || return
-      read_pane || return
-    fi
-    ;;
-  title)
-    now=$("$tmux_bin" display -p "%s|#{?#{${AGX_OPT}hostname},#{${AGX_OPT}hostname},#{host_short}}" 2>/dev/null)
-    host=${now#*|}; now=${now%%|*}
-    [ -n "$now" ] || bare_clock
-    ;;
-  bare)
-    if [ -n "$SSH_CONNECTION$SSH_TTY" ] || [ "$AGENTMUX_TITLE" = 1 ]; then bare_clock; else return; fi
-    ;;
-  none)
+  if [ "$mode" = none ]; then
+    # Nothing displays this agent: keep the markers current and publish nothing.
+    if [ "$event" = SessionEnd ]; then rm -rf "$dir"; return; fi
     read_file start
-    [ "$rf" = NOW ] && { bare_clock; put start "$now"; }
+    [ "$rf" = NOW ] && put start "$(date +%s)"
     return
-    ;;
-  esac
+  fi
+  if ! read_pane; then
+    [ "$mode" = hop ] || return
+    force_resolve=1; resolve_display; [ "$mode" = hop ] || return
+    read_pane || return
+  fi
+  if [ "$mode" = hop ] && [ "$force_resolve" != 1 ] && { [ "$ptty" != "$ctty" ] || is_shell "$pcmd"; }; then
+    force_resolve=1; resolve_display; [ "$mode" = hop ] || return
+    read_pane || return
+  fi
 
   # ---- values to publish ----------------------------------------------------------------
   read_file start; start=$rf
@@ -506,59 +466,38 @@ main() {
   fi
 
   # ---- one write round-trip -------------------------------------------------------------
-  case $mode in
-  direct | hop)
-    set --
-    # A direct/hopped agent makes this pane local again. Invalidate the complete decoded
-    # remote summary atomically with the local write so no renderer can prefer stale SSH
-    # state, even if the pane title has not changed yet.
-    for o in r_host r_n r_worst r_worst2 r_deleg r_proj r_kind r_start r_exp r_seen r_done r_prev r_notified; do
+  set --
+  if [ "$event" = SessionEnd ]; then
+    for o in state kind project start subagents detail sid updated; do
       set -- "$@" set -pu -t "$pane" "$AGX_OPT$o" \;
     done
-    if [ "$event" = SessionEnd ]; then
-      for o in state kind project start subagents detail sid updated host; do
-        set -- "$@" set -pu -t "$pane" "$AGX_OPT$o" \;
-      done
-    else
-      set -- "$@" \
-        set -p -t "$pane" "${AGX_OPT}state" "$pub_state" \; \
-        set -p -t "$pane" "${AGX_OPT}kind" "$kind" \; \
-        set -p -t "$pane" "${AGX_OPT}project" "$proj" \; \
-        set -p -t "$pane" "${AGX_OPT}start" "$pub_start" \; \
-        set -p -t "$pane" "${AGX_OPT}subagents" "$live" \; \
-        set -p -t "$pane" "${AGX_OPT}detail" "$detail" \; \
-        set -p -t "$pane" "${AGX_OPT}sid" "$sid" \; \
-        set -p -t "$pane" "${AGX_OPT}updated" "$now" \; \
-        set -p -t "$pane" "${AGX_OPT}host" "$host" \;
-    fi
-    oldifs=$IFS
-    IFS='
+  else
+    set -- \
+      set -p -t "$pane" "${AGX_OPT}state" "$pub_state" \; \
+      set -p -t "$pane" "${AGX_OPT}kind" "$kind" \; \
+      set -p -t "$pane" "${AGX_OPT}project" "$proj" \; \
+      set -p -t "$pane" "${AGX_OPT}start" "$pub_start" \; \
+      set -p -t "$pane" "${AGX_OPT}subagents" "$live" \; \
+      set -p -t "$pane" "${AGX_OPT}detail" "$detail" \; \
+      set -p -t "$pane" "${AGX_OPT}sid" "$sid" \; \
+      set -p -t "$pane" "${AGX_OPT}updated" "$now" \;
+  fi
+  oldifs=$IFS
+  IFS='
 '
-    for c in $clients; do
-      [ -n "$c" ] && set -- "$@" refresh-client -S -t "$c" \;
-    done
-    IFS=$oldifs
-    set -- "$@" wait-for -S "$AGX_REDRAW"
-    tm "$@" >/dev/null 2>&1
-    ;;
-  title | bare)
-    tty=/dev/tty
-    [ "$mode" = title ] && tty=$ctty
-    if [ "$event" = SessionEnd ]; then
-      emit_title "$tty" ""
-    else
-      san "$detail" 32 sp
-      emit_title "$tty" "h=$host|s=$pub_state|k=$kind|p=$proj|b=$pub_start|n=$live|u=$now|x=1|w=|d=$san_out~"
-    fi
-    ;;
-  esac
+  for c in $clients; do
+    [ -n "$c" ] && set -- "$@" refresh-client -S -t "$c" \;
+  done
+  IFS=$oldifs
+  set -- "$@" wait-for -S "$AGX_REDRAW"
+  tm "$@" >/dev/null 2>&1
 
   if [ "$event" = SessionEnd ]; then
     rm -rf "$dir"
     return
   fi
 
-  if [ -n "$notify_kind" ] && [ "$mode" != title ] && [ "$mode" != bare ]; then
+  if [ -n "$notify_kind" ]; then
     case $kind in claude) pretty="Claude Code" ;; *) pretty=Codex ;; esac
     case $notify_kind in
     blocked) body="${proj:-agent} needs you: $detail" ;;

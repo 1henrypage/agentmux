@@ -9,12 +9,11 @@ different states, saved as docs/sidebar.png, then:
 -->
 
 I kept losing track of which agent was waiting on me. With several running across tmux
-windows and an ssh host or two, the one you are not looking at is always the one stuck on
-a permission prompt. The overview that fixes this comes from
-[herdr](https://github.com/herdrdev/herdr). herdr is a multiplexer of its own though, and
-I wanted to stay in tmux, so agentmux does the same thing as a plugin: a badge on every
-tab, a sidebar listing every agent, and a desktop notification when an agent you are not
-watching needs you or finishes.
+windows, the one you are not looking at is always the one stuck on a permission prompt. The
+overview that fixes this comes from [herdr](https://github.com/herdrdev/herdr). herdr is a
+multiplexer of its own though, and I wanted to stay in tmux, so agentmux does the same thing
+as a plugin: a badge on every tab, a sidebar listing every agent, and a desktop notification
+when an agent you are not watching needs you or finishes.
 
 ## States
 
@@ -62,9 +61,8 @@ and what tmux currently sees.
 Agents read their hooks at startup, so restart any that were already running. Codex also
 needs one `/hooks` in its TUI to trust the new entries.
 
-You need tmux 3.4 or newer, a POSIX sh, Python 3.9 or newer for the sidebar and for
-decoding remote titles, and a Nerd Font for the glyphs. The installer uses jq when it is
-present and Python otherwise.
+You need tmux 3.4 or newer, a POSIX sh, Python 3.9 or newer for the sidebar, and a Nerd Font
+for the glyphs. The installer uses jq when it is present and Python otherwise.
 
 ## Usage
 
@@ -73,16 +71,24 @@ present and Python otherwise.
 Each tab shows the badge, the label `project:agent` and, while a turn runs, a timer such as
 `3m05s`. The project is the name of the nearest git checkout above the agent's working
 directory, the agent is `claude` or `codex`. With several agent panes in one window the
-badge is the worst state among them and the label follows the active pane. A remote agent
-carries its host in the label: `󰐠 devbox/api-server:claude`.
+badge is the worst state among them and the label follows the active pane.
 
 ### Sidebar
 
 `prefix a` opens a pane down the left of the current window, 46 columns wide, and closes it
-again. It follows you from window to window, lists every agent on the tmux server grouped
-by host with the worst state first, and cannot take focus. Each agent gets a detail line:
-the prompt it is working on, the tool it is waiting for permission on, or `finished 3m ago`.
+again. It follows you from window to window, lists every agent on the tmux server with the
+worst state first, and cannot take focus. Each agent gets a detail line: the prompt it is
+working on, the tool it is waiting for permission on, or `finished 3m ago`.
 `@agentmux_sidebar_density compact` drops the detail line and fits twice as many agents.
+
+`@agentmux_sidebar_skip` keeps the sidebar out of chosen windows. It is a format evaluated
+for the active pane of your current window, and while it is true the sidebar leaves that
+window and comes back once you move on. To keep it clear of a pane running another tmux that
+marks its title, for example:
+
+```tmux
+set -g @agentmux_sidebar_skip '#{m:tmux@*,#{pane_title}}'
+```
 
 ### Notifications
 
@@ -90,13 +96,10 @@ An agent in a window you are not looking at sends a desktop notification when it
 `blocked` or `done`, through `terminal-notifier` or `osascript` on macOS and `notify-send`
 on Linux. Windows you are looking at never notify, and nothing ever makes a sound.
 
-### Remote agents
+### Remote hosts
 
-Install agentmux in the tmux on a host you ssh into and its agents appear in your local
-tabs and sidebar as well. The remote tmux encodes its agent states into the terminal title
-and the local tmux decodes them from the pane that runs ssh. This works through nested hops
-such as a bastion, and it works without a remote tmux at all, because the hook writes the
-title itself when it notices an ssh connection.
+Each tmux server shows its own agents. Install agentmux in the tmux on a host you ssh into
+and its agents appear in that tmux's tabs and sidebar.
 
 ### omnigent
 
@@ -111,13 +114,13 @@ Set these in `~/.tmux.conf` before the `run` line for TPM.
 |---|---|---|
 | `@agentmux_width` | `46` | sidebar width in columns |
 | `@agentmux_key` | `a` | toggle key under prefix, `off` for none |
-| `@agentmux_titles` | `auto` | `auto` encodes state into the title for tmux clients and writes a readable title for anything else, `human` never encodes, `off` leaves `set-titles` alone |
+| `@agentmux_titles` | `on` | `on` sets the terminal title to `session:window`, plus ` - agent blocked` or ` - agent done` while an agent is in that state; `off` leaves `set-titles` alone, and your own `set-titles-string` can embed `#{E:@agentmux_title_human}` |
 | `@agentmux_notify` | `on` | notify on `blocked` |
 | `@agentmux_notify_done` | `on` | notify on `done` |
 | `@agentmux_ttl` | `14400` | seconds after which a stale state renders as `idle` |
 | `@agentmux_sidebar_density` | `full` | `compact` for one line per agent |
-| `@agentmux_hostname` | `#{host_short}` | host name shown for local agents |
-| `@agentmux_color_<name>` | terminal colours | `blocked`, `done`, `delegating`, `working`, `idle`, `project`, `agent`, `remote`, `text`, `fg`, `dim`, `sidebar_bg` |
+| `@agentmux_sidebar_skip` | unset | format; while it is true for the active pane of your current window, the sidebar stays out of that window |
+| `@agentmux_color_<name>` | terminal colours | `blocked`, `done`, `delegating`, `working`, `idle`, `project`, `agent`, `text`, `fg`, `dim`, `sidebar_bg` |
 
 If you use tmux-resurrect, add `set -g @resurrect-processes '~agentmux-sidebar'` so the
 sidebar comes back after a restore.
@@ -130,10 +133,9 @@ permission request, tool use, stop, sub-agent start and stop. On each event the 
 out the new state and writes it into options on the tmux pane the agent runs in. The
 badge, label and timer are tmux formats over those options, so drawing the status line
 never forks a process, and nothing polls. The sidebar is a Python renderer that repaints
-when the hook signals it. Over ssh the same state rides in the terminal title, and the
-local tmux decodes it whenever the title of an ssh pane changes.
+when the hook signals it.
 
-The option contract, the title grammar and the hook state machine are in
+The option contract and the hook state machine are in
 [docs/CONTRACT.md](docs/CONTRACT.md).
 
 ## Known warts

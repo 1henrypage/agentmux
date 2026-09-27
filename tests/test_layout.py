@@ -56,55 +56,25 @@ class CellsTest(unittest.TestCase):
 
 class ModelTest(unittest.TestCase):
     def test_model_from_fixture(self):
-        model = sb.build_model(load_rows(), NOW, "%9", "laptop")
-        hosts = [h for h, _ in model.groups]
-        self.assertEqual(hosts, ["", "devbox"])
-        local = model.groups[0][1]
+        model = sb.build_model(load_rows(), NOW, "%9")
         # worst first: done, delegating, working, then the idle one (shell grace)
-        self.assertEqual([a.state for a in local], ["done", "delegating", "working", "idle"])
+        self.assertEqual([a.state for a in model.agents], ["done", "delegating", "working", "idle"])
         # the stale agent (shell + updated 900 s ago) is gone, the sidebar row is skipped
-        self.assertNotIn("stale", [a.project for a in local])
-        remote = model.groups[1][1]
-        self.assertEqual([a.state for a in remote], ["blocked", "working"])
-        self.assertEqual(remote[0].target, "main:2.1")
-        self.assertEqual(
-            model.counts, {"done": 1, "delegating": 1, "working": 2, "idle": 1, "blocked": 1}
-        )
+        self.assertNotIn("stale", [a.project for a in model.agents])
+        self.assertEqual(model.counts, {"done": 1, "delegating": 1, "working": 1, "idle": 1})
 
-    def test_ttl_and_expiry(self):
+    def test_ttl(self):
+        model = sb.build_model(load_rows(), NOW, "%9", ttl=100)
+        states = {a.project: a.state for a in model.agents}
+        self.assertEqual(states["herdr"], "idle")  # done, 200 s old > ttl 100
+        self.assertEqual(states[".dotfiles"], "working")
+
+    def test_grouped_sessions_list_a_pane_once(self):
         rows = load_rows()
-        model = sb.build_model(rows, NOW, "%9", "laptop", ttl=100)
-        local = {a.project: a.state for a in model.groups[0][1]}
-        self.assertEqual(local["herdr"], "idle")  # done, 200 s old > ttl 100
-        self.assertEqual(local[".dotfiles"], "working")
-        # remote expiry in the past drops the whole group
-        for r in rows:
-            if r["pane_id"] == "%5":
-                r["r_exp"] = str(NOW - 1)
-        model = sb.build_model(rows, NOW, "%9", "laptop")
-        self.assertEqual([h for h, _ in model.groups], [""])
-
-    def test_remote_seen_renders_done_as_idle(self):
-        rows = load_rows()
-        for r in rows:
-            if r["pane_id"] == "%5":
-                r["pane_title"] = r["pane_title"].replace("s=blocked", "s=done")
-                r["r_seen"] = "1"
-        model = sb.build_model(rows, NOW, "%9", "laptop")
-        remote = model.groups[1][1]
-        self.assertEqual({a.state for a in remote}, {"idle", "working"})
-
-    def test_self_echo_dropped(self):
-        rows = load_rows()
-        model = sb.build_model(rows, NOW, "%9", "devbox")
-        self.assertEqual([h for h, _ in model.groups], [""])
-
-    def test_host_order_forgets(self):
-        order = sb.HostOrder()
-        self.assertEqual(order.touch(["b", "a"], 0), ["b", "a"])
-        self.assertEqual(order.touch(["a"], 10), ["a"])
-        self.assertEqual(order.touch(["a", "b"], 20), ["b", "a"])  # b remembered
-        self.assertEqual(order.touch(["a", "b"], 100), ["a", "b"])  # b forgotten, re-added
+        twin = dict(next(r for r in rows if r["pane_id"] == "%1"), session_name="3-twin")
+        model = sb.build_model([*rows, twin], NOW, "%9")
+        self.assertEqual([a.target for a in model.agents].count("3:1.1"), 1)
+        self.assertEqual(len(model.agents), 4)
 
 
 class GoldenTest(unittest.TestCase):
@@ -120,8 +90,6 @@ class GoldenTest(unittest.TestCase):
             "--width",
             "46",
             "--no-color",
-            "--host",
-            "laptop",
             *extra,
         ]
         return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
@@ -140,7 +108,7 @@ class GoldenTest(unittest.TestCase):
     def test_46x8_truncates_with_footer(self):
         out = self.run_once("--height", "8")
         self.assertEqual(out, self.golden("sidebar_46x8.txt"))
-        self.assertIn("+4 more", out)
+        self.assertIn("+2 more", out)
 
     def test_compact(self):
         out = self.run_once("--height", "12", "--density", "compact")
@@ -157,20 +125,20 @@ class GoldenTest(unittest.TestCase):
         self.assertIn("#{@agentmux_state}", out)
 
     def test_empty(self):
-        model = sb.build_model([], NOW, "%1", "h")
+        model = sb.build_model([], NOW, "%1")
         frame = sb.render(model, 30, 5, sb.Theme({}, enabled=False))
         self.assertEqual(frame.lines[2], sb.fit(" no agents", 30))
         self.assertEqual(len(frame.lines), 5)
 
     def test_colour_lines_keep_width(self):
-        model = sb.build_model(load_rows(), NOW, "%9", "laptop")
+        model = sb.build_model(load_rows(), NOW, "%9")
         frame = sb.render(model, 46, 24, sb.Theme(dict(sb.DEFAULT_COLORS)))
         import re
 
         strip = re.compile(r"\x1b\[[0-9;]*m")
         for line in frame.lines:
             self.assertEqual(sb.str_width(strip.sub("", line)), 46)
-        self.assertEqual(frame.rows[0][0], 3)  # first agent row y
+        self.assertEqual(frame.rows[0][0], 2)  # first agent row y, right under the rule
 
 
 class TermTest(unittest.TestCase):

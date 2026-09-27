@@ -1,7 +1,7 @@
 #!/bin/sh
 # agentmux - TPM entry point. Sets option defaults, the format fragments the status line
-# reads (`#{E:@agentmux_badge}` / `_label` / `_timer`), the sidebar management hooks, the
-# outgoing AGX1 title channel and the toggle key. Everything here is fork-free at runtime:
+# reads (`#{E:@agentmux_badge}` / `_label` / `_timer`), the terminal title, the sidebar
+# management hooks and the toggle key. Everything here is fork-free at runtime:
 # hooks run `run-shell -C '<format>'`, which expands a format into a tmux command list and
 # executes it in-server (an empty expansion is a no-op).
 #
@@ -21,7 +21,7 @@ setg() { tmux set -g "$1" "$2"; }
 # --------------------------------------------------------------------------- defaults ----
 default "${O}width" 46
 default "${O}key" a
-default "${O}titles" auto
+default "${O}titles" on
 default "${O}notify" on
 default "${O}notify_done" on
 default "${O}ttl" 14400
@@ -33,7 +33,6 @@ default "${O}color_working" yellow
 default "${O}color_idle" colour240
 default "${O}color_project" cyan
 default "${O}color_agent" colour245
-default "${O}color_remote" blue
 default "${O}color_text" white
 default "${O}color_fg" default
 default "${O}color_dim" colour240
@@ -44,38 +43,26 @@ default "${O}color_sidebar_bg" default
 WIDTH=$(opt "${O}width")
 KEY=$(opt "${O}key")
 
-# ------------------------------------------------------------------------ host ----
-# host_short unless the user overrides it (containers, "localhost", tests).
-HOSTF="#{?#{${O}hostname},#{${O}hostname},#{host_short}}"
-
 # ------------------------------------------------------------------------ glyphs ----
 G_WORKING='●'   # U+25CF
 G_IDLE='·'      # U+00B7
 G_BLOCKED='󰸇'   # U+F0E07 nf-md-hand_back_right
 G_DONE='󰄬'      # U+F012C nf-md-check
 G_DELEG='󰀐'     # U+F0010 nf-md-account-multiple
-G_REMOTE='󰐠'    # U+F0420 nf-md-remote
 
 # ------------------------------------------------------------- per-pane state ----
 # Shell gate: a pane's agent state counts only while its foreground process is not a shell.
 # This self-heals a kill -9'd agent whose SessionEnd never fired.
 SG='#{m/r:^-?(zsh|bash|fish|sh|dash|ksh|nu)$,#{pane_current_command}}'
-# Local state, rendered idle once older than @agentmux_ttl.
+# State, rendered idle once older than @agentmux_ttl.
 LS="#{?#{m:-*,#{e|-|:#{e|+|:#{${O}updated},#{${O}ttl}},%s}},idle,#{${O}state}}"
-# A remote summary is authoritative only while the pane still carries AGX1 and its cached
-# expiry is either the explicit one-shot value 0 or has not passed yet. Empty/malformed
-# expiries are invalid. Every remote consumer below uses this one condition.
-RVALID="#{&&:#{m:${AGENTMUX_MAGIC}|*,#{pane_title}},#{||:#{==:#{${O}r_exp},0},#{&&:#{m/r:^[1-9][0-9]*$,#{${O}r_exp}},#{!:#{m:-*,#{e|-|:#{${O}r_exp},%s}}}}}}"
-RS="#{?#{${O}r_seen},#{${O}r_worst2},#{${O}r_worst}}"
-setg "${O}pstate" "#{?${SG},,#{?${RVALID},${RS},#{?#{${O}state},${LS},}}}"
-# 1 when the pane is a live agent (local or remote), 0 otherwise.
-LIVE="#{&&:#{!:${SG}},#{?${RVALID},1,#{?#{${O}state},1,0}}}"
-setg "${O}plive" "$LIVE"
-setg "${O}pproj" "#{?${RVALID},#{${O}r_proj},#{${O}project}}"
-setg "${O}pkind" "#{?${RVALID},#{${O}r_kind},#{${O}kind}}"
-setg "${O}pstart" "#{?${RVALID},#{${O}r_start},#{${O}start}}"
-setg "${O}phost" "#{?${RVALID},#{${O}r_host},}"
-setg "${O}pdeleg" "#{?${RVALID},#{${O}r_deleg},#{${O}subagents}}"
+setg "${O}pstate" "#{?${SG},,#{?#{${O}state},${LS},}}"
+# 1 when the pane is a live agent, 0 otherwise.
+setg "${O}plive" "#{&&:#{!:${SG}},#{?#{${O}state},1,0}}"
+setg "${O}pproj" "#{${O}project}"
+setg "${O}pkind" "#{${O}kind}"
+setg "${O}pstart" "#{${O}start}"
+setg "${O}pdeleg" "#{${O}subagents}"
 
 # ------------------------------------------------------------- per-window ----
 setg "${O}wstates" "#{P:#{E:${O}pstate} }"
@@ -89,13 +76,12 @@ wpick() {
 wpick proj
 wpick kind
 wpick start
-wpick host
 
 # ------------------------------------------------------------- tab fragments ----
 WS="#{E:${O}wstates}"
 setg "${O}badge" "#{?#{m:*blocked*,${WS}},#[fg=#{${O}color_blocked}]${G_BLOCKED},#{?#{m:*done*,${WS}},#[fg=#{${O}color_done}]${G_DONE},#{?#{m:*delegating*,${WS}},#[fg=#{${O}color_delegating}]${G_DELEG}#{E:${O}wdeleg},#{?#{m:*working*,${WS}},#[fg=#{${O}color_working}]${G_WORKING},#[fg=#{${O}color_idle}]${G_IDLE}}}}}#[fg=#{${O}color_fg}]"
 
-setg "${O}label" "#{?automatic-rename,#{?#{m:?*,#{E:${O}whost}},#[fg=#{${O}color_remote}]${G_REMOTE} #{E:${O}whost}/,}#[fg=#{${O}color_project}]#{?#{m:?*,#{E:${O}wproj}},#{E:${O}wproj},#{b:pane_current_path}}#[fg=#{${O}color_dim}]:#[fg=#{${O}color_agent}]#{?#{m:?*,#{E:${O}wkind}},#{E:${O}wkind},#{pane_current_command}}#[fg=#{${O}color_fg}],#[fg=#{${O}color_fg}]#W}"
+setg "${O}label" "#{?automatic-rename,#[fg=#{${O}color_project}]#{?#{m:?*,#{E:${O}wproj}},#{E:${O}wproj},#{b:pane_current_path}}#[fg=#{${O}color_dim}]:#[fg=#{${O}color_agent}]#{?#{m:?*,#{E:${O}wkind}},#{E:${O}wkind},#{pane_current_command}}#[fg=#{${O}color_fg}],#[fg=#{${O}color_fg}]#W}"
 
 SECS="#{E:${O}wsecs}"
 setg "${O}wsecs" "#{e|-|:%s,#{E:${O}wstart}}"
@@ -104,26 +90,17 @@ MIN="#{e|/|:${SECS},60}"
 setg "${O}elapsed" "#{?#{m:-*,#{e|-|:${SECS},3600}},${MIN}m#{?#{m:-*,#{e|-|:#{e|m|:${SECS},60},10}},0,}#{e|m|:${SECS},60}s,#{e|/|:${SECS},3600}h#{?#{m:-*,#{e|-|:#{e|m|:${MIN},60},10}},0,}#{e|m|:${MIN},60}m}"
 setg "${O}timer" "#{?#{m:?*,#{E:${O}wstart}}, #[fg=#{${O}color_text}]#{E:${O}elapsed}#[fg=#{${O}color_fg}],}"
 
-# ------------------------------------------------------------- title channel ----
-# Outgoing AGX1 title: every live agent pane on this server, plus anything decoded from our
-# own ssh panes re-embedded verbatim (their x=1 rewritten to x=0 when that pane is hidden).
-SAFE='[^A-Za-z0-9 ._@+()-]'
-VIS="#{&&:#{pane_active},#{&&:#{window_active},#{session_attached}}}"
-ENTRY="#{?${SG},,#{?#{${O}state},h=${HOSTF}|s=${LS}|k=#{${O}kind}|p=#{s/${SAFE}/_/:${O}project}|b=#{${O}start}|n=#{${O}subagents}|u=#{${O}updated}|x=${VIS}|w=#{s/[^A-Za-z0-9._-]/_/:session_name}:#{window_index}.#{pane_index}|d=#{s/${SAFE}/_/:#{=32:#{${O}detail}}}~,}#{?${RVALID},#{?${VIS},#{s/^${AGENTMUX_MAGIC}[|][^~]*~//:pane_title},#{s/[|]x=1[|]/|x=0|/:#{s/^${AGENTMUX_MAGIC}[|][^~]*~//:pane_title}}},}}"
-setg "${O}title_enc" "${AGENTMUX_MAGIC}|h=${HOSTF}|t=#{e|/|:%s,60}|hb=60~#{S:#{W:#{P:${ENTRY}}}}"
+# ------------------------------------------------------------- terminal title ----
+# "session:window", plus " - agent blocked" / " - agent done" while any agent on this server
+# is in that state. @agentmux_title_human is public: a config that owns set-titles-string
+# itself (@agentmux_titles off) embeds it with #{E:@agentmux_title_human}.
 setg "${O}allstates" "#{S:#{W:#{E:${O}wstates}}}"
 setg "${O}title_human" "#{session_name}:#{window_name}#{?#{m:*blocked*,#{E:${O}allstates}}, - agent blocked,#{?#{m:*done*,#{E:${O}allstates}}, - agent done,}}"
-case $(opt "${O}titles") in
-auto)
-  tmux set -as terminal-features ",tmux*:title"
-  setg set-titles on
-  setg set-titles-string "#{?#{m/r:^(tmux|screen),#{client_termname}},#{=1800:#{E:${O}title_enc}},#{E:${O}title_human}}"
-  ;;
-human)
+# Anything but `off` counts as on, so a value left over from before (`auto`, `human`) still works.
+if [ "$(opt "${O}titles")" != off ]; then
   setg set-titles on
   setg set-titles-string "#{E:${O}title_human}"
-  ;;
-esac
+fi
 
 # ------------------------------------------------------------- sidebar finders ----
 # No cached pane id anywhere: the sidebar is whichever pane carries @agentmux_sidebar.
@@ -137,34 +114,53 @@ setg "${O}sb_win" "${SBQ_PRE}#{window_id}${SBQ_POST}"
 setg "${O}sb_npanes" "${SBQ_PRE}#{window_panes}${SBQ_POST}"
 setg "${O}sb_ok" "${SBQ_PRE}#{&&:#{==:#{pane_left},0},#{&&:#{==:#{pane_top},0},#{==:#{pane_height},#{window_height}}}}${SBQ_POST}"
 setg "${O}sb_wok" "${SBQ_PRE}#{==:#{pane_width},#{${O}width}}${SBQ_POST}"
-# The owner client's current window / zoom flag / whether it is wide enough for a sidebar.
-TGT_PRE="#{L:#{?#{==:#{client_name},#{${O}owner}},"
-TGT_POST=",}}"
+# The owner client's current window / zoom flag / whether it is wide enough for a sidebar /
+# whether @agentmux_sidebar_skip (a user format, evaluated for that window's active pane)
+# keeps the sidebar out of it. Each is empty when the owner is not attached.
+# FOOTGUN: inside #{L:} the window and pane are still the enclosing context's (a hook's target
+# window, say), not the looped client's. So the owner's window is found explicitly: its
+# session (client_session) and that session's active window, whose pane is its active pane.
+TGT_PRE="#{L:#{?#{==:#{client_name},#{${O}owner}},#{S:#{?#{==:#{session_name},#{client_session}},#{W:#{?window_active,"
+TGT_POST=",}},}},}}"
 setg "${O}tgt_win" "${TGT_PRE}#{window_id}${TGT_POST}"
 setg "${O}tgt_zoom" "${TGT_PRE}#{window_zoomed_flag}${TGT_POST}"
 setg "${O}tgt_wide" "${TGT_PRE}#{?#{m:-*,#{e|-|:#{e|-|:#{window_width},#{${O}width}},30}},0,1}${TGT_POST}"
+setg "${O}tgt_skip" "${TGT_PRE}#{?#{E:${O}sidebar_skip},1,0}${TGT_POST}"
 
 SB="#{E:${O}sb_pane}"
 TW="#{E:${O}tgt_win}"
 ENSURE="run-shell -b '$PLUGIN_DIR/bin/agentmux ensure'"
 JOIN="join-pane -bdfh -l #{${O}width} -s ${SB} -t ${TW}"
-FOLLOW_COND="#{&&:#{${O}on},#{&&:#{m:?*,${SB}},#{&&:#{m:?*,${TW}},#{&&:#{!=:#{E:${O}sb_win},${TW}},#{&&:#{!:#{E:${O}tgt_zoom}},#{E:${O}tgt_wide}}}}}}"
+FOLLOW_COND="#{&&:#{${O}on},#{&&:#{m:?*,${SB}},#{&&:#{m:?*,${TW}},#{&&:#{!=:#{E:${O}sb_win},${TW}},#{&&:#{!:#{E:${O}tgt_zoom}},#{&&:#{E:${O}tgt_wide},#{!:#{E:${O}tgt_skip}}}}}}}}"
 LONELY_COND="#{&&:#{m:?*,${SB}},#{==:#{E:${O}sb_npanes},1}}"
-FIX_COND="#{&&:#{m:?*,${SB}},#{&&:#{!:#{E:${O}tgt_zoom}},#{&&:#{E:${O}tgt_wide},#{==:#{E:${O}sb_win},${TW}}}}}"
+SKIP_COND="#{&&:#{m:?*,${SB}},#{&&:#{==:#{E:${O}sb_win},${TW}},#{E:${O}tgt_skip}}}"
+FIX_COND="#{&&:#{m:?*,${SB}},#{&&:#{!:#{E:${O}tgt_zoom}},#{&&:#{E:${O}tgt_wide},#{&&:#{==:#{E:${O}sb_win},${TW}},#{!:#{E:${O}tgt_skip}}}}}}"
 FIX="#{?#{E:${O}sb_ok},#{?#{E:${O}sb_wok},,resize-pane -x #{${O}width} -t ${SB}},break-pane -d -s ${SB} ; ${JOIN}}"
 setg "${O}follow" "#{?${FOLLOW_COND},${JOIN},}"
+# `run-shell -C` runs the commands it generates on a later event-loop turn, so two hooks for
+# one event (e.g. after-kill-pane and window-layout-changed) can both decide to kill the same
+# sidebar, and the loser's kill-pane fails in the user's own command. A kill therefore
+# re-checks, when it runs, that the pane it names is still the sidebar: the #-escaped format
+# below survives this expansion and is evaluated by `if -F`, atomically with the kill.
+IF_STILL_SB="if -F \"##{==:##{E:${O}sb_pane#}#,${SB}#}\""
 # Exclusive branches so a generated command list never references a pane it just killed.
-setg "${O}layout" "#{?${FOLLOW_COND},${JOIN},#{?${LONELY_COND},kill-pane -t ${SB} ; ${ENSURE},#{?${FIX_COND},${FIX},}}}"
-setg "${O}ensure_or_layout" "#{?#{&&:#{${O}on},#{!:#{m:?*,${SB}}}},${ENSURE},#{E:${O}layout}}"
-# Seen: a done pane you are looking at becomes idle; a viewed ssh pane marks its remote
-# done-set as seen. Always ends with the redraw signal so the sidebar repaints.
-setg "${O}seen" "#{P:#{?#{&&:#{==:#{${O}state},done},#{&&:#{window_active},#{session_attached}}},set -p -t #{pane_id} ${O}state idle ; ,}#{?#{&&:${RVALID},#{&&:#{!:#{${O}r_seen}},#{&&:#{window_active},#{session_attached}}}},set -p -t #{pane_id} ${O}r_seen 1 ; ,}}wait-for -S ${AGENTMUX_REDRAW_CHANNEL}"
+# A skipped window evicts the sidebar but leaves @agentmux_on alone, so ensure_or_layout
+# brings it back as soon as the owner's window is no longer skipped.
+setg "${O}layout" "#{?${FOLLOW_COND},${JOIN},#{?${LONELY_COND},${IF_STILL_SB} \"kill-pane -t ${SB} ; ${ENSURE}\",#{?${SKIP_COND},${IF_STILL_SB} \"kill-pane -t ${SB}\",#{?${FIX_COND},${FIX},}}}}"
+# Forks `ensure` only when it would create a sidebar: on, none yet, and a target it may use.
+ENSURE_COND="#{&&:#{${O}on},#{&&:#{!:#{m:?*,${SB}}},#{&&:#{!:#{E:${O}tgt_zoom}},#{&&:#{E:${O}tgt_wide},#{!:#{E:${O}tgt_skip}}}}}}"
+setg "${O}ensure_or_layout" "#{?${ENSURE_COND},${ENSURE},#{E:${O}layout}}"
+# Seen: a done pane you are looking at becomes idle. Always ends with the redraw signal so
+# the sidebar repaints.
+setg "${O}seen" "#{P:#{?#{&&:#{==:#{${O}state},done},#{&&:#{window_active},#{session_attached}}},set -p -t #{pane_id} ${O}state idle ; ,}}wait-for -S ${AGENTMUX_REDRAW_CHANNEL}"
 
 # ------------------------------------------------------------- hooks (indices 70-79) ----
+# Anything that can change the owner's window, or what its active pane is showing, runs
+# ensure_or_layout: that is what re-creates a sidebar evicted by @agentmux_sidebar_skip.
 hook() { tmux set-hook -g "$1" "$2"; }
-hook 'session-window-changed[70]' "run-shell -C '#{E:${O}layout}'"
+hook 'session-window-changed[70]' "run-shell -C '#{E:${O}ensure_or_layout}'"
 hook 'session-window-changed[71]' "run-shell -C '#{E:${O}seen}'"
-hook 'client-session-changed[70]' "run-shell -C '#{E:${O}layout}'"
+hook 'client-session-changed[70]' "run-shell -C '#{E:${O}ensure_or_layout}'"
 hook 'client-session-changed[71]' "run-shell -C '#{E:${O}seen}'"
 hook 'client-active[70]' "set -gF ${O}owner '#{client_name}'"
 hook 'client-active[71]' "run-shell -C '#{E:${O}ensure_or_layout}'"
@@ -174,11 +170,13 @@ hook 'client-focus-in[70]' "run-shell -C '#{E:${O}seen}'"
 # Focus bounce: the sidebar can never be the active pane.
 hook 'window-pane-changed[70]' "if -F '#{${O}sidebar}' 'select-pane -l'"
 hook 'window-pane-changed[71]' "run-shell -C '#{E:${O}seen}'"
+hook 'window-pane-changed[72]' "run-shell -C '#{E:${O}ensure_or_layout}'"
 hook 'window-layout-changed[70]' "run-shell -C '#{E:${O}layout}'"
 hook 'after-select-layout[70]' "run-shell -C '#{E:${O}layout}'"
 hook 'after-kill-pane[70]' "run-shell -C '#{E:${O}layout}'"
 hook 'pane-exited[70]' "run-shell -C '#{E:${O}layout}'"
-hook 'pane-title-changed[70]' "if -F '#{m:${AGENTMUX_MAGIC}|*,#{pane_title}}' \"run-shell -b '$PLUGIN_DIR/bin/agentmux title-changed #{pane_id}'\""
+# Skip formats usually read the pane title. Zero forks unless the sidebar must be re-created.
+hook 'pane-title-changed[70]' "run-shell -C '#{E:${O}ensure_or_layout}'"
 
 # ------------------------------------------------------------- key ----
 if [ -n "$KEY" ] && [ "$KEY" != off ]; then

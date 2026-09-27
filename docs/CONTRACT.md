@@ -1,10 +1,12 @@
 # agentmux data contract
 
-Everything agentmux does flows through three channels: **pane options** on the tmux server
-that displays an agent, an **AGX1 title** carried over ssh in OSC 2, and a **scratch
-directory** the hook keeps as its source of truth. This file is the contract between the
-pieces (`hooks/agentmux-hook`, `agentmux.tmux`, `bin/agentmux`, `agentmux/sidebar.py`,
-`agentmux/title_changed.py`). Change it here first.
+Everything agentmux does flows through two channels: **pane options** on the tmux server
+that displays an agent, and a **scratch directory** the hook keeps as its source of truth.
+This file is the contract between the pieces (`hooks/agentmux-hook`, `agentmux.tmux`,
+`bin/agentmux`, `agentmux/sidebar.py`). Change it here first.
+
+A tmux server shows the agents running under it and nothing else. An agent on a host you ssh
+into shows up in the tmux on that host.
 
 ## States
 
@@ -27,81 +29,58 @@ viewed). Hooks never cache the state option; they derive it from the scratch mar
 | `@agentmux_detail` | `[A-Za-z0-9_. -]`, at most 24 | blocked: `permission <tool>`, `question`, `plan review`, `elicitation`, `agent input`; else the prompt excerpt; `resuming` after an assumed auto-resume |
 | `@agentmux_sid` | agent session id | |
 | `@agentmux_updated` | epoch of the last write | formats render a state older than `@agentmux_ttl` as idle |
-| `@agentmux_host` | this server's host name | `@agentmux_hostname` override, else `#{host_short}` |
 | `@agentmux_sidebar` | `1` on the sidebar pane | set by `ensure` and by the renderer |
 
 `SessionEnd` unsets all of them (`set -pu`).
-
-### Remote summary (written by `bin/agentmux title-changed` on ssh panes)
-
-| option | meaning |
-|---|---|
-| `@agentmux_r_host` | host in the AGX1 header |
-| `@agentmux_r_n` | number of decoded entries (self-echo removed) |
-| `@agentmux_r_worst` | ladder over all entries |
-| `@agentmux_r_worst2` | ladder excluding `done` (used once seen) |
-| `@agentmux_r_deleg` | sub-agent count of the first delegating entry |
-| `@agentmux_r_proj`, `_r_kind`, `_r_start` | label/timer values of the entry the badge shows |
-| `@agentmux_r_exp` | epoch after which the summary is stale (`0` = never, one-shot writer) |
-| `@agentmux_r_seen` | `1` once the window was viewed and no new `done` entry arrived since |
-| `@agentmux_r_done` | space-separated `host:target` keys of the done entries (seen bookkeeping) |
-| `@agentmux_r_prev` | last decoded title (skip duplicates) |
-| `@agentmux_r_notified` | `host\|target\|start\|state\|updated` of the last notification (flap guard) |
-
-Every direct or hopped local-agent write unsets the complete `@agentmux_r_*` summary in the
-same tmux transaction. Local pane state is authoritative once a pane stops representing an
-SSH session, even if its old AGX1 pane title has not changed yet.
 
 ## Global options
 
 Set by the user before `run tpm`; the plugin fills in defaults.
 
 `@agentmux_width` (46), `@agentmux_key` (`a`, `off` to skip the binding),
-`@agentmux_titles` (`auto|human|off`), `@agentmux_notify` (`on|off`),
+`@agentmux_titles` (`on|off`), `@agentmux_notify` (`on|off`),
 `@agentmux_notify_done` (`on|off`), `@agentmux_ttl` (14400 s),
-`@agentmux_sidebar_density` (`full|compact`), `@agentmux_hostname` (override for
-`#{host_short}`), and the twelve colours `@agentmux_color_{blocked,done,delegating,working,
-idle,project,agent,remote,text,fg,dim,sidebar_bg}`.
+`@agentmux_sidebar_density` (`full|compact`), `@agentmux_sidebar_skip` (a format, unset by
+default, see [Sidebar placement](#sidebar-placement)), and the eleven colours
+`@agentmux_color_{blocked,done,delegating,working,idle,project,agent,text,fg,dim,sidebar_bg}`.
 
 Runtime: `@agentmux_on` (sidebar wanted), `@agentmux_owner` (client whose current window
 the sidebar follows).
 
 ## Rendering rules (all fork-free)
 
-- A pane's local state counts only while `pane_current_command` is not a shell
+- A pane's state counts only while `pane_current_command` is not a shell
   (`-?(zsh|bash|fish|sh|dash|ksh|nu)`), which self-heals a `kill -9`'d agent. The sidebar
   keeps a row for 15 s after the shell is back so a normal exit does not flicker.
 - A state older than `@agentmux_ttl` renders as idle.
-- A remote summary counts only while the pane title is still AGX1 and `@agentmux_r_exp` is
-  `0` or in the future. Once invalid or expired it supplies no state, label, timer, liveness,
-  or seen bookkeeping and is not forwarded into this server's outgoing AGX1 aggregate.
 - Window badge: ladder over all panes in the window. Label and timer follow the active pane
   when it is a live agent, else the first live agent pane in the window.
 
-## AGX1 title grammar
+## Terminal title
 
-```
-AGX1|h=<host>|t=<epoch/60>|hb=<60|0>~ ( ENTRY ~ )*
-ENTRY := h=<host>|s=<state>|k=<kind>|p=<project>|b=<start>|n=<subs>|u=<updated>
-         |x=<0|1>|w=<session:window.pane>|d=<detail>
-```
+With `@agentmux_titles on` (the default) the plugin sets `set-titles on` and
+`set-titles-string "#{E:@agentmux_title_human}"`, which reads `session:window`, plus
+` - agent blocked` or ` - agent done` while any agent on the server is in that state. `off`
+leaves both options to your config, which can still embed the public fragment
+`#{E:@agentmux_title_human}` in a title of its own.
 
-Printable ASCII only; `| ~ ; # % ,` never appear inside data (`p`/`d` are sanitised to
-`[A-Za-z0-9 ._@+()-]`, `w` to `[A-Za-z0-9:._-]`, `d` capped at 32). Every entry ends with
-`~`; a trailing segment without `~` is a truncated entry and is dropped. `x=1` marks the entry
-you would see looking at the pane carrying the title. `hb=60` means the writer re-emits at
-least once a minute (a tmux server running the plugin), `hb=0` a one-shot writer (the hook
-in bare-ssh mode, `w=` empty). A server re-embeds the entries decoded from its own ssh panes
-only while their remote summary is valid, verbatim, rewriting `x=1` to `x=0` when the
-embedding pane is not visible.
+## Sidebar placement
 
-The title is only emitted to a client whose `client_termname` starts with `tmux` or
-`screen` (an inner tmux talking to an outer one); every other client gets the human title
-`session:window[ - agent blocked| - agent done]`.
+The sidebar follows the owner client (`@agentmux_owner`) from window to window, except into
+a window that is zoomed, narrower than `@agentmux_width + 30` columns, or skipped. There it
+waits in the window it was in until the owner reaches one it may use.
+
+`@agentmux_sidebar_skip` is a format evaluated for the owner's current window, so for that
+window's active pane. While it is true the sidebar is removed from that window and not
+followed into it, and `@agentmux_on` stays `1`. The window, pane, session and
+`pane-title-changed` hooks re-run `@agentmux_ensure_or_layout`, which re-creates the sidebar
+as soon as the owner's window stops matching. agentmux knows nothing about what the format
+means; for example, a nested tmux that marks the title it sends can be kept clear of the
+sidebar with `set -g @agentmux_sidebar_skip '#{m:tmux@*,#{pane_title}}'`.
 
 ## Scratch directory (hook side, source of truth)
 
-`${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/agentmux-$USER/<server-pid|nosrv>/<pane|session>/`
+`${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/agentmux-$USER/<server-pid>/<pane>/`
 
 | file | content |
 |---|---|
@@ -109,7 +88,7 @@ The title is only emitted to a client whose `client_termname` starts with `tmux`
 | `main` | `running\|stopped` |
 | `blocked` | `<detail>\|<tool>\|<tool_use_id>` or empty |
 | `detail` | prompt excerpt or `resuming` |
-| `start` | epoch of the current turn (`NOW` until the first tmux round-trip resolves it), empty when idle |
+| `start` | epoch of the current turn (`NOW` until the next tmux round-trip, or `date +%s` in **none** mode, replaces it), empty when idle |
 | `state` | last derived state (for notification transitions only) |
 | `outer` | hop cache `sock\|pane\|client_tty` (omnigent) |
 | `subs/<gen>.<agent_id>.s` / `.e` | sub-agent started / ended markers |
@@ -136,15 +115,16 @@ sub-agents > 0 -> `delegating`; `start` non-empty -> `done`; else `idle`.
 
 ## Display-pane resolution
 
-`sock=${TMUX%%,*}`. Matches `*/tmux-[0-9]*/*` -> **direct** (`$TMUX_PANE`). Empty ->
-**bare**: emit a one-shot title to `/dev/tty` when `SSH_CONNECTION`/`SSH_TTY` is set or
-`AGENTMUX_TITLE=1`. Anything else (omnigent's private server) -> **hop**: take the first
-non-control client tty of that server and find the pane with that `pane_tty` on every
+An agent outside tmux (`$TMUX` or `$TMUX_PANE` empty) has nothing to show it on, so the hook
+exits before reading its input. Otherwise `sock=${TMUX%%,*}`. Matches `*/tmux-[0-9]*/*` ->
+**direct** (`$TMUX_PANE`). Anything else (omnigent's private server) -> **hop**: take the
+first non-control client tty of that server and find the pane with that `pane_tty` on every
 `${TMUX_TMPDIR:-/tmp}/tmux-*/*` server; not found -> try other
-`${TMPDIR:-/tmp}/omnigent-terminal-*/tmux.sock` servers (nested, depth <= 3); still not
-found -> **title** mode on that tty. No client at all -> web-only, markers only. The hop
-result is cached in `outer` and validated on every event (tty match, non-shell command);
-`SessionStart`/`UserPromptSubmit` always re-resolve.
+`${TMPDIR:-/tmp}/omnigent-terminal-*/tmux.sock` servers (nested, depth <= 3). No client at
+all (web-only), or still no pane -> **none**: the markers advance, nothing is published, and
+`SessionEnd` still wipes the directory. The hop result is cached in `outer` and validated on
+every event (tty match, non-shell command); `SessionStart`/`UserPromptSubmit` always
+re-resolve.
 
 ## Redraw signalling
 

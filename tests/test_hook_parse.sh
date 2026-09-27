@@ -23,7 +23,6 @@ export AGENTMUX_HOOK_LIB
 
 # --- constants agree between the hook and lib/constants.sh -------------------------------
 assert_eq "opt prefix" "$AGENTMUX_OPT" "$AGX_OPT"
-assert_eq "magic" "$AGENTMUX_MAGIC" "$AGX_MAGIC"
 assert_eq "san max" "$AGENTMUX_SAN_MAX" "$AGX_SAN_MAX"
 assert_eq "redraw channel" "$AGENTMUX_REDRAW_CHANNEL" "$AGX_REDRAW"
 

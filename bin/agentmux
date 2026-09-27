@@ -6,7 +6,6 @@
 #   agentmux status [--gc]                                        show hook/tmux/scratch state
 #   agentmux toggle <client>                                      open/close the sidebar (bound to prefix+a)
 #   agentmux ensure                                               create the sidebar if on and missing
-#   agentmux title-changed <pane>                                 decode an ssh pane's AGX1 title
 #   agentmux notify <title> <body>                                desktop notification, no sound
 #
 # Config files: ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json, ${CODEX_HOME:-~/.codex}/hooks.json
@@ -201,8 +200,8 @@ cmd_status() {
   fi
   tmux_bin=$(find_tmux) || { printf 'tmux: not found\n'; return; }
   printf '\nlive panes with state (server %s):\n' "$("$tmux_bin" display -p '#{pid}' 2>/dev/null || echo none)"
-  "$tmux_bin" list-panes -a -F "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command} state=#{${O}state} kind=#{${O}kind} proj=#{${O}project} subs=#{${O}subagents} eff=#{E:${O}pstate} remote=#{${O}r_host}/#{${O}r_worst} sidebar=#{${O}sidebar}" 2>/dev/null \
-    | grep -E 'state=[a-z]|remote=[^/]|sidebar=1' || printf '  (none)\n'
+  "$tmux_bin" list-panes -a -F "#{session_name}:#{window_index}.#{pane_index} #{pane_current_command} state=#{${O}state} kind=#{${O}kind} proj=#{${O}project} subs=#{${O}subagents} eff=#{E:${O}pstate} sidebar=#{${O}sidebar}" 2>/dev/null \
+    | grep -E 'state=[a-z]|sidebar=1' || printf '  (none)\n'
   base=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
   base=${base%/}/agentmux-${USER:-${LOGNAME:-u}}
   printf '\nscratch: %s\n' "$base"
@@ -211,10 +210,7 @@ cmd_status() {
     [ -d "$srv" ] || continue
     pid=${srv##*/}
     alive=yes
-    case $pid in
-    nosrv) alive=n/a ;;
-    *) kill -0 "$pid" 2>/dev/null || alive=dead ;;
-    esac
+    kill -0 "$pid" 2>/dev/null || alive=dead
     printf '  %s (%s)\n' "$pid" "$alive"
     if [ "$alive" = dead ] && [ "$gc" = 1 ]; then rm -rf "$srv"; printf '    removed\n'; continue; fi
     for d in "$srv"/*; do
@@ -261,18 +257,22 @@ cmd_ensure() {
     [ "$title" = "$AGENTMUX_SIDEBAR_TITLE" ] && [ -z "$mark" ] && "$tmux_bin" kill-pane -t "$pid" 2>/dev/null
   done
   # Formats go through variables: bash 3.2 mis-parses nested #{..} inside "$(...)".
-  f_win="#{E:${O}tgt_win}" f_zoom="#{E:${O}tgt_zoom}" f_wide="#{E:${O}tgt_wide}"
+  f_win="#{E:${O}tgt_win}" f_zoom="#{E:${O}tgt_zoom}" f_wide="#{E:${O}tgt_wide}" f_skip="#{E:${O}tgt_skip}"
   win=$("$tmux_bin" display -p "$f_win" 2>/dev/null)
   zoom=$("$tmux_bin" display -p "$f_zoom" 2>/dev/null)
   wide=$("$tmux_bin" display -p "$f_wide" 2>/dev/null)
+  skip=$("$tmux_bin" display -p "$f_skip" 2>/dev/null)
   if [ -z "$win" ]; then
     win=$("$tmux_bin" list-clients -F '#{?client_control_mode,,#{window_id}}' 2>/dev/null | grep -m1 .)
     [ -n "$win" ] || return 0
+    f_wskip="#{?#{E:${O}sidebar_skip},1,0}"
     zoom=$("$tmux_bin" display -p -t "$win" '#{window_zoomed_flag}' 2>/dev/null)
+    skip=$("$tmux_bin" display -p -t "$win" "$f_wskip" 2>/dev/null)
     wide=1
   fi
   [ "$zoom" = 1 ] && return 0
   [ "$wide" = 0 ] && return 0
+  [ "$skip" = 1 ] && return 0
   width=$("$tmux_bin" show -gqv "${O}width"); width=${width:-46}
   bg=$("$tmux_bin" show -gqv "${O}color_sidebar_bg"); bg=${bg:-default}
   py=$(command -v python3 2>/dev/null) || die "python3 not found"
@@ -296,12 +296,6 @@ cmd_toggle() {
     [ -n "$client" ] && "$tmux_bin" set -g "${O}owner" "$client"
     cmd_ensure
   fi
-}
-
-cmd_title_changed() {
-  [ -n "${1:-}" ] || die "title-changed: pane id required"
-  py=$(command -v python3 2>/dev/null) || exit 0
-  exec "$py" "$PLUGIN_DIR/agentmux/title_changed.py" "$1"
 }
 
 # ------------------------------------------------------------------------ notify ----
@@ -339,10 +333,11 @@ uninstall-hooks) cmd_uninstall_hooks "$@" ;;
 status) cmd_status "$@" ;;
 toggle) cmd_toggle "$@" ;;
 ensure) cmd_ensure "$@" ;;
-title-changed) cmd_title_changed "$@" ;;
 notify) cmd_notify "$@" ;;
 "" | -h | --help | help)
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  # The header comment, whatever its length: every line after the shebang up to the first
+  # non-comment line.
+  awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"
   ;;
 *) die "unknown command: $cmd (try --help)" ;;
 esac
